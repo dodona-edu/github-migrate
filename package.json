@@ -1,0 +1,35 @@
+{
+  "name": "github-migrate",
+  "version": "1.0.0",
+  "description": "Script to migrate a repository from one GitHub instance to another",
+  "main": "migrate.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node migrate.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dodona-edu/github-migrate.git"
+  },
+  "keywords": [
+    "github",
+    "migration",
+    "git",
+    "issues"
+  ],
+  "author": "Team Dodona <dodona@ugent.be>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/dodona-edu/github-migrate/issues"
+  },
+  "homepage": "https://github.com/dodona-edu/github-migrate#readme",
+  "devDependencies": {
+    "eslint": "^6.0.1",
+    "eslint-config-google": "^0.9.1"
+  },
+  "dependencies": {
+    "commander": "^2.20.0",
+    "js-yaml": "^3.13.1",
+    "unirest": "^0.6.0"
+  }
+}
