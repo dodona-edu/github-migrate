@@ -1,6 +1,6 @@
 {
     "parserOptions": {
-        "ecmaVersion": 6,
+        "ecmaVersion": 2019,
             "sourceType": "module"
     },
         "extends": ["eslint:recommended", "google"],
@@ -18,12 +18,13 @@
             "valid-jsdoc": "off",
             "space-before-function-paren": ["error", {"anonymous": "always", "named": "never", "asyncArrow": "always"}],
             "no-param-reassign": ["error", { "props": false }],
-            "indent": ["error", 2],
+            "indent": ["error", 2, {"CallExpression": {"arguments": "first"}}],
             "max-len": "off",
             "quotes": ["error", "double"],
             "new-cap": "off",
             "no-invalid-this": "off",
             "no-console": "off",
+            "no-throw-literal": "off",
         },
         "env": {
             "node": true
