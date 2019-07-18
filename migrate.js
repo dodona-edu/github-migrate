@@ -42,12 +42,21 @@ function readJson(path) {
 program.version("0.1.0")
   .option("-c, --config <path>",
           "Configuration file path. Defaults to ./config.yml")
-  .option("-s, --skip-existing",
-          "Skip steps if a file already exists.")
+  .option("-s, --source <repo>",
+          "Source repository, overrides the source in the configuration")
+  .option("-d, --destination <repo>",
+          "Destination repository, overrides the destination in the configuration")
+  .option("-r, --reset",
+          "Deletes and recreate the destination repository. Use with caution!")
+  .option("-o, --overwrite",
+          "Overwrites steps if a file already exists instead of resuming.")
   .parse(process.argv);
 
 const configFile = program.config || "./config.yml";
 const config = yaml.safeLoad(fs.readFileSync(configFile));
+
+config.source.repository = program.source || config.source.repository;
+config.destination.repository = program.source || config.destination.repository;
 
 const sourceInfo = parseRepoUrl(config.source.repository);
 const destInfo = parseRepoUrl(config.destination.repository);
@@ -64,13 +73,15 @@ config.destination = {
   ...destInfo,
 };
 
-const repoDir = "data/" + config.destination.reponame;
+const repoDir = "data/" + config.source.reponame;
 fs.mkdirSync(repoDir, {recursive: true});
 
 const cloneDir = repoDir + "/clone.git";
 const issuePath = repoDir + "/issues.json";
 const commentPath = repoDir + "/comments.json";
-const missingPath = repoDir + "/missingCommits.json";
+const missingPath = repoDir + "/missing.json";
+const mentionsPath = repoDir + "/mentions.json";
+const creatorsPath = repoDir + "/creators.json";
 
 function assert(assertion, message) {
   if (!assertion) throw (message || "AssertionError");
@@ -91,11 +102,12 @@ async function invoke(method, url, data, token) {
   } catch (e) {
     const response = e.response;
     if (response.status === 403 &&
-        response.headers["x-ratelimit-remaining"] === 0) {
+        response.headers["x-ratelimit-remaining"] == 0) {
       warn("Ratelimit encountered, retrying in 1 second");
       sh("sleep 1");
       return await invoke(method, url, data, token);
     } else {
+      console.dir(e.response.data);
       throw e;
     }
   }
@@ -103,6 +115,10 @@ async function invoke(method, url, data, token) {
 
 function get(url, token) {
   return invoke("get", url, null, token);
+}
+
+function destroy(url, token) {
+  return invoke("delete", url, null, token);
 }
 
 function patch(url, data, token) {
@@ -151,7 +167,7 @@ async function fetchAllIssues() {
   log("Fetching issues");
   const issues = (await collectUntilNull(fetchIssue, 1))
     .sort((a, b) => a.number - b.number);
-  writeJson(`${repoDir}/issues.json`, issues);
+  writeJson(issuePath, issues);
   return issues;
 }
 
@@ -175,11 +191,11 @@ async function fetchAllComments() {
   const issueComments = await fetchCommentsOfType("issues/comments");
   const commitComments = await fetchCommentsOfType("comments");
   const comments = []
-    .concat(pullComments)
-    .concat(issueComments)
-    .concat(commitComments)
+    .concat(...pullComments)
+    .concat(...issueComments)
+    .concat(...commitComments)
     .sort((a, b) => a.created_at - b.created_at);
-  writeJson(`${repoDir}/comments.json`, comments);
+  writeJson(commentPath, comments);
   return comments;
 }
 
@@ -197,10 +213,12 @@ function parseRepoUrl(cloneUrl) {
 
 function moveRepository() {
   log("Moving repository");
-  progress("Cloning from source");
-  sh(`git clone --mirror ${config.source.repository} ${cloneDir}`);
-  progress("Replacing packed-refs");
-  sh(`sed -i.bak 's_ refs/pull/_ refs/pr/_' ${cloneDir}/packed-refs`);
+  if (checkIfNeeded(cloneDir)) {
+    progress("Cloning from source");
+    sh(`git clone --mirror ${config.source.repository} ${cloneDir}`);
+    progress("Replacing packed-refs");
+    sh(`sed -i.bak 's_ refs/pull/_ refs/pr/_' ${cloneDir}/packed-refs`);
+  }
   progress("Pushing to destination");
   sh(`git -C ${cloneDir} push --mirror ${config.destination.repository}`);
 }
@@ -213,129 +231,236 @@ async function commitExists(sha) {
 }
 
 // TODO: also check for item.head
-async function missingCommits(issues, comments) {
-  const commits = []
-    .concat(issues)
-    .concat(comments)
+async function missingCommits(items) {
+  const commits = items
     .map(item => {
       if (item.base) { // Pull Request
-        return {url: item.url, sha: item.base.sha};
+        return {url: item.html_url, sha: item.base.sha};
       } else if (item.pull_request_url) { // Review comment
-        return {url: item.url, sha: item.original_commit_id};
+        return {url: item.html_url, sha: item.original_commit_id};
       } else if (item.commit_id) { // Commit comment
-        return {url: item.url, sha: item.commit_id};
+        return {url: item.html_url, sha: item.commit_id};
       }
     })
     .filter(item => item !== undefined)
     .map(async item => ({...item, exists: await commitExists(item.sha)}));
 
   const missing = (await Promise.all(commits)).filter(item => !item.exists);
-  writeJson(`${repoDir}/missing.json`, missing);
+  writeJson(missingPath, missing);
   return missing;
 }
 
-async function createPullReference(pull) {
-  progress(`Creating reference for #${pull.number}`);
-  await post(`${config.destination.url}/git/refs`,
-             {
-               "ref": `refs/heads/pr-${pull.number}-base`,
-               "sha": pull.base.sha,
-             },
-             config.destination.default_token);
-}
-
-async function createPullReferences(issues) {
-  for (let pull of issues.filter(issue => issue.base)) {
-    await createPullReference(pull);
-  }
-}
-
-function prefix(item) {
-  let prefix = `Originally authored by ${item.user.login}` +
-    ` on ${item.created_at.toString()}.`;
-  if (item.closed_at) {
-    prefix += " Closed ";
-    if (item.closed_by) {
-      prefix += ` by ${item.closed_by.login}`;
-    }
-    prefix += ` on ${item.closed_at.toString()}.`;
-  }
-  return prefix;
-}
-
-async function createPullRequest(pull) {
+async function createBranch(branchname, sha) {
+  progress(`Creating branch ${branchname}`);
   try {
-    await post(`${config.destination.url}/pulls`,
+    await post(`${config.destination.url}/git/refs`,
                {
-                 title: pull.title,
-                 body: `${prefix(pull)}\r\n\r\n${pull.body}`,
-                 head: `pr/${pull.number}/head`,
-                 base: `pr-${pull.number}-base`,
+                 "ref": `refs/heads/${branchname}`,
+                 "sha": sha,
                },
                config.destination.default_token);
   } catch (e) {
-    throw e;
+    if (e.response.data.message === "Reference already exists") {
+      warn(`Branch #${branchname} already exists. Ignoring...`);
+    } else {
+      throw e;
+    }
   }
 }
 
-async function createIssue(issue) {
-  await post(`${config.destination.url}/issues`,
+function suffix(item) {
+  let suffix = `_Originally authored by ${item.user.login}` +
+    ` on ${new Date(item.created_at).toString()}.`;
+  if (item.closed_at) {
+    suffix += " Closed ";
+    if (item.closed_by) {
+      suffix += ` by ${item.closed_by.login}`;
+    }
+    suffix += ` on ${new Date(item.closed_at).toString()}.`;
+  }
+  return suffix + "_";
+}
+
+async function createPullRequest(pull) {
+  progress(`Creating PR #${pull.number}`);
+
+  const headBranch = `pr-${pull.number}-head`;
+  const baseBranch = `pr-${pull.number}-base`;
+
+  await createBranch(headBranch, pull.head.sha);
+  await createBranch(baseBranch, pull.base.sha);
+
+  await post(`${config.destination.url}/pulls`,
              {
-               "title": issue.title,
-               "body": `${prefix(issue)}\r\n\r\n${issue.body}`,
+               title: pull.title,
+               body: `${pull.body}\r\n\r\n${suffix(pull)}`,
+               head: headBranch,
+               base: baseBranch,
+             },
+             config.destination.default_token);
+  /* await patch(`${config.destination.url}/pulls/${pull.number}`,
+              {
+                state: pull.state,
+              },
+              config.destination.default_token);
+              */
+}
+
+async function createBrokenPullRequest(pull) {
+  progress(`Creating broken PR #${pull.number}`);
+  const notice = `_**Note:** the base commit (${pull.base.sha}) is lost,` +
+    " so unfortunately we cannot show you the changes added by this PR._";
+  throw "Broken PR!";
+  await post(`${config.destination.url}/pulls`,
+             {
+               title: pull.title,
+               body: `${pull.body}\r\n\r\n${suffix(pull)}\r\n\r\n${notice}\r\n\r\n`,
+               head: `pr-${pull.number}-head`,
+               base: `pr-${pull.number}-base`,
              },
              config.destination.default_token);
 }
 
-async function createIssuesAndPulls(issues) {
+async function createIssue(issue) {
+  progress(`Creating issue #${issue.number}`);
+  await post(`${config.destination.url}/issues`,
+             {
+               title: issue.title,
+               body: `${issue.body}\r\n\r\n${suffix(issue)}`,
+             },
+             config.destination.default_token);
+  /* await patch(`${config.destination.url}/issues/${issue.number}`,
+              {
+                state: issue.state,
+              },
+              config.destination.default_token);
+              */
+}
+
+async function createIssuesAndPulls(issues, missing) {
   log("Creating issues and pull requests");
+  const missingHashes = new Set(missing.map(c => c.sha));
   for (let issue of issues) {
     if (issue.pull_request) {
-      await createPullRequest(issue);
+      if (missingHashes.has(issue.base.sha)) {
+        await createBrokenPullRequest(issue);
+      } else {
+        await createPullRequest(issue);
+      }
     } else {
       await createIssue(issue);
     }
   }
 }
 
+
+async function findCreators(items) {
+  log("Searching for creator usernames");
+  const creatorSet = new Set(items.map(item => item.user.login));
+  const promises = Array.from(creatorSet).map(async username => {
+    const user = (await get(`${config.source.api}/users/${username}`)).data;
+    return [username, user.email];
+  });
+
+  const creators = new Map(await Promise.all(promises));
+  writeJson(creatorsPath, Array.from(creators));
+  return creators;
+}
+
+async function filterMentions(items) {
+  log("Filtering mentioned usernames");
+  const regex = /@[-A-z0-9]{1,39}/;
+  const mentions = new Map();
+  for (let item of items) {
+    const body = item.body;
+
+    const parts = [];
+
+    let last = 0;
+    let match = regex.exec(body);
+    while (match) {
+      parts.push(body.slice(last, last + match.index));
+      let username = match[0].slice(1);
+
+      if (!mentions.has(username)) {
+        const response = await get(`${config.source.api}/users/${username}`);
+        if (response.status === 200) {
+          const user = response.data;
+          mentions.set(username, user.email);
+        }
+      }
+
+      let newName = config.destination.usernames[username];
+      if (newName) {
+        // TODO: for 'real' version: actually mention user?
+        parts.push(`\`@${newName}\``);
+      } else {
+        parts.push(`\`@${username}\``);
+      }
+      last += match.index + match[0].length;
+      match = regex.exec(body.slice(last));
+    }
+    parts.push(body.slice(last));
+    item.body = parts.join();
+  }
+
+  writeJson(mentionsPath, Array.from(mentions));
+  return mentions;
+}
+
 function checkIfNeeded(path) {
-  debugger;
   if (fs.existsSync(path)) {
-    if (program.skipExisting) {
-      return false;
-    } else {
+    if (program.overwrite) {
       sh(`rm -rf ${path}`);
+    } else {
+      return false;
     }
   }
   return true;
 }
 
+/**
+ * Reset the destination repository by deleting and recreating it. This needs
+ * the 'delete_repositories' scope. Use with caution.
+ */
+async function resetDestination() {
+  await destroy(config.destination.url, config.destination.default_token);
+  await post(`${config.destination.api}/orgs/${config.destination.owner}/repos`,
+             {name: config.destination.reponame},
+             config.destination.default_token);
+}
+
 (async () => {
   try {
-    if (checkIfNeeded(cloneDir)) {
-      moveRepository();
+    if (program.reset) {
+      await resetDestination();
     }
 
-    // TODO
-    const issues = false //checkIfNeeded(issuePath)
+    moveRepository();
+
+    const issues = checkIfNeeded(issuePath)
       ? (await fetchAllIssues())
       : readJson(issuePath);
 
-    const comments = false // checkIfNeeded(commentPath)
+    const comments = checkIfNeeded(commentPath)
       ? (await fetchAllComments())
       : readJson(commentPath);
 
+    const items = issues.concat(comments);
+
     const missing = checkIfNeeded(missingPath)
-      ? (await missingCommits(issues, comments))
+      ? (await missingCommits(items))
       : readJson(missingPath);
 
     if (missing.length > 0) {
+      warn("Missing commits detected:");
       console.dir(missing);
-      throw "Missing commits detected";
     }
 
-    await createPullReferences(issues);
-    // await createIssuesAndPulls(issues);
+    const creators = await findCreators(items);
+    const mentions = await filterMentions(items);
+
+    await createIssuesAndPulls(issues, missing);
   } catch (e) {
     console.dir(e);
   }
