@@ -82,6 +82,7 @@ fs.mkdirSync(repoDir, {recursive: true});
 const cloneDir = repoDir + "/clone";
 const mirrorDir = repoDir + "/mirror.git";
 const issuePath = repoDir + "/issues.json";
+const labelPath = repoDir + "/labels.json";
 const commentPath = repoDir + "/comments.json";
 const missingPath = repoDir + "/missing.json";
 const mentionsPath = repoDir + "/mentions.json";
@@ -97,7 +98,6 @@ async function invoke(method, url, data, token) {
       method: method,
       url: url,
       data: data,
-      validateStatus: s => s === 404 || (s >= 200 && s < 300),
       headers: {
         "Authorization": "token " + (token || config.source.token),
         "User-Agent": "node.js",
@@ -111,7 +111,6 @@ async function invoke(method, url, data, token) {
       sh("sleep 1");
       return await invoke(method, url, data, token);
     } else {
-      console.dir(e.response.data);
       throw e;
     }
   }
@@ -133,6 +132,10 @@ function post(url, data, token) {
   return invoke("post", url, data, token);
 }
 
+function put(url, data, token) {
+  return invoke("put", url, data, token);
+}
+
 /**
  * Call and await the given callback with an increasing integer while
  * collecting the result in an array. Continues until the callback returns
@@ -152,19 +155,26 @@ async function collectUntilNull(callback) {
 
 async function fetchIssue(issueNumber) {
   progress(`Fetching issue ${issueNumber}`);
-  const request = await get(`${config.source.url}/issues/${issueNumber}`);
-  if (request.status === 404) {
-    return null;
-  }
+  try {
+    const request = await get(`${config.source.url}/issues/${issueNumber}`);
 
-  const issue = request.data;
-  if (issue.pull_request) {
-    const pull = await get(`${config.source.url}/pulls/${issueNumber}`);
-    issue.base = pull.data.base;
-    issue.head = pull.data.head;
+    const issue = request.data;
+    if (issue.pull_request) {
+      const pull = (await get(`${config.source.url}/pulls/${issueNumber}`)).data;
+      issue.base = pull.base;
+      issue.head = pull.head;
+
+      const events = (await get(issue.events_url)).data;
+      issue.merged = events.some(e => e.event === "merged");
+    }
+
+    return issue;
+  } catch (e) {
+    if (e.response && e.response.status === 404) {
+      return null;
+    }
+    throw e;
   }
-  // writeJson(`${issueDir}/issue${issueNumber}.json`, issue);
-  return issue;
 }
 
 async function fetchAllIssues() {
@@ -173,6 +183,22 @@ async function fetchAllIssues() {
     .sort((a, b) => a.number - b.number);
   writeJson(issuePath, issues);
   return issues;
+}
+
+async function fetchLabels(page) {
+  const response = await get(`${config.source.url}/labels?` +
+                             `page=${page}&per_page=100`);
+  if (response.data.length === 0) {
+    return null;
+  }
+  return response.data;
+}
+
+async function fetchAllLabels() {
+  log("Fetching labels");
+  const labels = [].concat(...(await collectUntilNull(fetchLabels)));
+  writeJson(labelPath, labels);
+  return labels;
 }
 
 async function fetchCommentPage(type, page) {
@@ -236,9 +262,16 @@ function moveRepository() {
 
 async function commitExists(sha) {
   const url = `${config.destination.url}/git/commits/${sha}`;
-  const response = await get(url, config.destination.default_token);
-  assert(response.status);
-  return response.status !== 404;
+  try {
+    await get(url, config.destination.default_token);
+    return true;
+  } catch (e) {
+    if (e.response.status == 404) {
+      return false;
+    } else {
+      throw e;
+    }
+  }
 }
 
 async function missingCommits(items) {
@@ -288,18 +321,51 @@ async function createBranch(branchname, sha) {
   }
 }
 
-function suffix(item) {
-  let suffix = `_[Original](${item.html_url})`;
-  suffix += ` by ${item.user.login}`; // TODO: mention user if not authoring
-  suffix += ` on ${new Date(item.created_at).toString()}.`;
-  if (item.closed_at) {
-    suffix += "\r\n\r\nClosed ";
-    if (item.closed_by) {
-      suffix += ` by ${item.closed_by.login}`;
-    }
-    suffix += ` on ${new Date(item.closed_at).toString()}.`;
+function formatDate(date) {
+  const items = new Date(date).toString().split(" ");
+  const day = items.slice(0, 4).join(" ");
+  const time = items[4].split(":").slice(0, 2).join(":");
+  return `${day} at ${time}`;
+}
+
+function authorToken(srcUser) {
+  const token = config.destination.tokens[srcUser];
+  if (!token) {
+    warn(`Missing token for ${srcUser}, using default token`);
   }
-  return suffix + "_";
+  if (srcUser === "rbmaerte") { // TODO: turn on for all users
+    return token || config.destination.default_token;
+  } else {
+    return config.destination.default_token;
+  }
+}
+
+function author(srcUser) {
+  const user = config.destination.usernames[srcUser];
+  return user ? `\`@${user}\`` : srcUser; // TODO: actually mention
+}
+
+function suffix(item) {
+  let type;
+  if (item.pull_request) {
+    type = "pull request";
+  } else if (item.labels) {
+    type = "issue";
+  } else {
+    type = "comment";
+  }
+
+  let suffix = `_[Original ${type}](${item.html_url})`;
+  suffix += ` by ${author(item.user.login)}`;
+  suffix += ` on ${formatDate(item.created_at)}._`;
+  if (item.closed_at) {
+    suffix += `\n_${item.merged ? "Merged" : "Closed"} `;
+    if (item.closed_by) {
+      suffix += ` by ${author(item.closed_by.login)}`;
+    }
+    suffix += ` on ${formatDate(item.closed_at)}._`;
+  }
+  return suffix;
 }
 
 function branchNames(pull) {
@@ -312,10 +378,15 @@ function branchNames(pull) {
 async function createPullRequest(pull) {
   progress(`Creating PR #${pull.number}`);
 
-  const {head, base} = branchNames(pull);
-
-  await createBranch(head, pull.head.sha);
-  await createBranch(base, pull.base.sha);
+  let head, base;
+  if (pull.state == "open") {
+    head = pull.head.ref;
+    base = pull.base.ref;
+  } else {
+    ({head, base} = branchNames(pull));
+    await createBranch(head, pull.head.sha);
+    await createBranch(base, pull.base.sha);
+  }
 
   try {
     await post(`${config.destination.url}/pulls`,
@@ -325,7 +396,7 @@ async function createPullRequest(pull) {
                  head: head,
                  base: base,
                },
-               config.destination.default_token);
+               authorToken(pull.user.login));
   } catch (e) {
     if (e.response.status == 422) {
       console.dir(e.response.data);
@@ -343,12 +414,6 @@ async function createPullRequest(pull) {
       throw e;
     }
   }
-  /* await patch(`${config.destination.url}/pulls/${pull.number}`,
-              {
-                state: pull.state,
-              },
-              config.destination.default_token);
-              */
 }
 
 async function createBrokenPullRequest(pull) {
@@ -376,7 +441,7 @@ async function createBrokenPullRequest(pull) {
                head: head,
                base: base,
              },
-             config.destination.default_token);
+             authorToken(pull.user.login));
 }
 
 async function createIssue(issue) {
@@ -386,22 +451,13 @@ async function createIssue(issue) {
                title: issue.title,
                body: `${issue.body}\r\n\r\n${suffix(issue)}`,
              },
-             config.destination.default_token);
-  /* await patch(`${config.destination.url}/issues/${issue.number}`,
-              {
-                state: issue.state,
-              },
-              config.destination.default_token);
-              */
+             authorToken(issue.user.login));
 }
 
 async function createIssuesAndPulls(issues, missing) {
   log("Creating issues and pull requests");
   const missingHashes = new Set(missing.map(c => c.sha));
   for (let issue of issues) {
-    if (issue.number < 1097) {
-      continue;
-    }
     if (issue.pull_request) {
       if (missingHashes.has(issue.base.sha)) {
         await createBrokenPullRequest(issue);
@@ -418,13 +474,8 @@ async function createIssuesAndPulls(issues, missing) {
 async function findCreators(items) {
   log("Searching for creator usernames");
   const creatorSet = new Set(items.map(item => item.user.login));
-  const promises = Array.from(creatorSet).map(async username => {
-    const user = (await get(`${config.source.api}/users/${username}`)).data;
-    return [username, user.email];
-  });
-
-  const creators = new Map(await Promise.all(promises));
-  writeJson(creatorsPath, Array.from(creators));
+  const creators = Array.from(creatorSet);
+  writeJson(creatorsPath, creators);
   return creators;
 }
 
@@ -444,16 +495,18 @@ async function filterMentions(items) {
       let username = match[0].slice(1);
 
       if (!mentions.has(username)) {
-        const response = await get(`${config.source.api}/users/${username}`);
-        if (response.status === 200) {
+        try {
+          const response = await get(`${config.source.api}/users/${username}`);
           const user = response.data;
           mentions.set(username, user.email);
+        } catch (e) {
+          // ignore, user does not exist
         }
       }
 
       let newName = config.destination.usernames[username];
       if (newName) {
-        // TODO: for 'real' version: actually mention user?
+        // TODO: actually mention user
         parts.push(`\`@${newName}\``);
       } else {
         parts.push(`\`@${username}\``);
@@ -496,15 +549,23 @@ async function resetDestination() {
 async function createPullComment(comment) {
   const pullNumber = comment.pull_request_url.split("/").pop();
   progress(`Creating review comment for PR #${pullNumber} (${comment.id})`);
-  await post(`${config.destination.url}/pulls/${pullNumber}/comments`,
-             {
-               body: `${comment.body}\r\n\r\n${suffix(comment)}`,
-               commit_id: comment.original_commit_id,
-               path: comment.path,
-               position: comment.original_position,
-
-             },
-             config.destination.default_token);
+  try {
+    await post(`${config.destination.url}/pulls/${pullNumber}/comments`,
+               {
+                 body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+                 commit_id: comment.original_commit_id,
+                 path: comment.path,
+                 position: comment.original_position,
+               },
+               authorToken(comment.user.login));
+  } catch (e) {
+    if (e.response.status == 422 &&
+        e.response.data.errors[0].message.endsWith("is not part of the pull request")) {
+      warn("Ignoring review comment because the original commit is gone. (This is normal)");
+    } else {
+      throw e;
+    }
+  }
 }
 
 async function createCommitComment(comment) {
@@ -512,12 +573,12 @@ async function createCommitComment(comment) {
   await post(`${config.destination.url}/commits/${comment.commit_id}/comments`,
              {
                body: `${comment.body}\r\n\r\n${suffix(comment)}`,
-               commit_id: comment.original_commit_id,
+               commit_id: comment.commit_id,
                path: comment.path,
                position: comment.original_position,
 
              },
-             config.destination.default_token);
+             authorToken(comment.user.login));
 }
 
 async function createIssueComment(comment) {
@@ -527,17 +588,13 @@ async function createIssueComment(comment) {
              {
                body: `${comment.body}\r\n\r\n${suffix(comment)}`,
              },
-             config.destination.default_token);
+             authorToken(comment.user.login));
 }
 
 async function createComments(comments, missingCommits) {
   log("Creating comments");
   let missingHashes = new Set(missingCommits.map(c => c.sha));
   for (let comment of comments) {
-    // TODO
-    if (comment.id < 4823) {
-      continue;
-    }
     if (comment.pull_request_url) {
       await createPullComment(comment);
     } else if (comment.commit_id) {
@@ -550,12 +607,88 @@ async function createComments(comments, missingCommits) {
   }
 }
 
+async function createLabels(labels) {
+  log("Creating labels");
+  labels.push({
+    name: "migrated",
+    color: "8fbcea",
+    description: "This item originates from the migrated github.ugent.be repository",
+  });
+  for (let label of labels) {
+    try {
+      await post(`${config.destination.url}/labels`,
+                 {
+                   name: label.name,
+                   color: label.color,
+                   description: label.description,
+                 },
+                 config.destination.default_token);
+    } catch (e) {
+      debugger;
+    }
+  }
+}
+
 async function showRateLimit() {
   const response = await get(config.destination.url,
                              config.destination.default_token);
   const remaining = response.headers["x-ratelimit-remaining"];
   const limit = response.headers["x-ratelimit-limit"];
   log(`Rate limit: ${remaining}/${limit} remaining`);
+}
+
+async function addLabels(issue) {
+  await patch(`${config.destination.url}/issues/${issue.number}`,
+              {
+                labels: issue.labels
+                  .map(label => label.name)
+                  .concat(["migrated"]),
+              },
+              config.destination.default_token);
+}
+
+async function updatePull(pull) {
+  progress(`Updating PR #${pull.number}`);
+  await addLabels(pull);
+  if (pull.merged) {
+    progress(`Merging PR #${pull.number}`);
+    await put(`${config.destination.url}/pulls/${pull.number}/merge`,
+              null,
+              authorToken(pull.closed_by.login));
+  } else if (pull.state === "closed") {
+    await patch(`${config.destination.url}/pulls/${pull.number}`,
+                {
+                  state: pull.state,
+                },
+                authorToken(pull.closed_by.login));
+  }
+}
+
+async function updateIssue(issue) {
+  progress(`Updating issue #${issue.number}`);
+  await addLabels(issue);
+  if (issue.state === "closed") {
+    await patch(`${config.destination.url}/issues/${issue.number}`,
+                {
+                  state: issue.state,
+                },
+                authorToken(issue.closed_by.login));
+  }
+}
+
+async function updateIssuesAndPulls(issues) {
+  log("Updating issues and pull requests");
+  for (let issue of issues) {
+    if (issue.pull_request) {
+      await updatePull(issue);
+    } else {
+      await updateIssue(issue);
+    }
+  }
+}
+
+function cleanRemoteRepo() {
+  sh(`git -C ${mirrorDir} push --mirror ${config.destination.repository}`);
 }
 
 (async () => {
@@ -574,6 +707,10 @@ async function showRateLimit() {
       ? (await fetchAllComments())
       : readJson(commentPath);
 
+    const labels = checkIfNeeded(labelPath)
+      ? (await fetchAllLabels())
+      : readJson(labelPath);
+
     const items = issues.concat(comments);
 
     const missing = checkIfNeeded(missingPath)
@@ -588,8 +725,13 @@ async function showRateLimit() {
     const creators = await findCreators(items);
     const mentions = await filterMentions(items);
 
-    // await createIssuesAndPulls(issues, missing);
+    await createLabels(labels);
+    await createIssuesAndPulls(issues, missing);
     await createComments(comments, missing);
+
+    await updateIssuesAndPulls(issues);
+
+    cleanRemoteRepo();
 
     await showRateLimit();
   } catch (e) {
