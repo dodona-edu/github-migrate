@@ -13,6 +13,7 @@ const colors = require("colors");
  * the current process
  */
 function sh(commandline, options) {
+  console.log(commandline);
   return childProcess.execSync(commandline, {stdio: "inherit", ...options});
 }
 
@@ -55,6 +56,8 @@ program.version("0.1.0")
 const configFile = program.config || "./config.yml";
 const config = yaml.safeLoad(fs.readFileSync(configFile));
 
+config.destination.admin_token = config.destination.admin_token || config.destination.default_token;
+
 config.source.repository = program.source || config.source.repository;
 config.destination.repository = program.source || config.destination.repository;
 
@@ -76,7 +79,8 @@ config.destination = {
 const repoDir = "data/" + config.source.reponame;
 fs.mkdirSync(repoDir, {recursive: true});
 
-const cloneDir = repoDir + "/clone.git";
+const cloneDir = repoDir + "/clone";
+const mirrorDir = repoDir + "/mirror.git";
 const issuePath = repoDir + "/issues.json";
 const commentPath = repoDir + "/comments.json";
 const missingPath = repoDir + "/missing.json";
@@ -134,8 +138,8 @@ function post(url, data, token) {
  * collecting the result in an array. Continues until the callback returns
  * null.
  */
-async function collectUntilNull(callback, start) {
-  let i = start || 0;
+async function collectUntilNull(callback) {
+  let i = 1;
   const collector = [];
   let result = await callback(i);
   while (result) {
@@ -165,7 +169,7 @@ async function fetchIssue(issueNumber) {
 
 async function fetchAllIssues() {
   log("Fetching issues");
-  const issues = (await collectUntilNull(fetchIssue, 1))
+  const issues = (await collectUntilNull(fetchIssue))
     .sort((a, b) => a.number - b.number);
   writeJson(issuePath, issues);
   return issues;
@@ -194,7 +198,7 @@ async function fetchAllComments() {
     .concat(...pullComments)
     .concat(...issueComments)
     .concat(...commitComments)
-    .sort((a, b) => a.created_at - b.created_at);
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
   writeJson(commentPath, comments);
   return comments;
 }
@@ -212,15 +216,22 @@ function parseRepoUrl(cloneUrl) {
 }
 
 function moveRepository() {
-  log("Moving repository");
-  if (checkIfNeeded(cloneDir)) {
-    progress("Cloning from source");
-    sh(`git clone --mirror ${config.source.repository} ${cloneDir}`);
+  log("Mirroring repository");
+  if (checkIfNeeded(mirrorDir)) {
+    progress("Creating mirror from source");
+    sh(`git clone --mirror ${config.source.repository} ${mirrorDir}`);
+    sh(`git -C ${mirrorDir} remote set-url origin ${config.destination.repository}`);
+    sh(`git -C ${mirrorDir} remote set-url --push origin ${config.destination.repository}`);
     progress("Replacing packed-refs");
-    sh(`sed -i.bak 's_ refs/pull/_ refs/pr/_' ${cloneDir}/packed-refs`);
+    sh(`sed -i.bak 's_ refs/pull/_ refs/pr/_' ${mirrorDir}/packed-refs`);
   }
   progress("Pushing to destination");
-  sh(`git -C ${cloneDir} push --mirror ${config.destination.repository}`);
+  sh(`git -C ${mirrorDir} push --mirror ${config.destination.repository}`);
+
+  if (checkIfNeeded(cloneDir)) {
+    progress("Creating clone from destination");
+    sh(`git clone ${config.destination.repository} ${cloneDir}`);
+  }
 }
 
 async function commitExists(sha) {
@@ -230,7 +241,6 @@ async function commitExists(sha) {
   return response.status !== 404;
 }
 
-// TODO: also check for item.head
 async function missingCommits(items) {
   const commits = items
     .map(item => {
@@ -242,10 +252,20 @@ async function missingCommits(items) {
         return {url: item.html_url, sha: item.commit_id};
       }
     })
-    .filter(item => item !== undefined)
-    .map(async item => ({...item, exists: await commitExists(item.sha)}));
+    .filter(item => item !== undefined);
 
-  const missing = (await Promise.all(commits)).filter(item => !item.exists);
+  const checked = new Set();
+  const missing = [];
+  for (let commit of commits) {
+    if (!checked.has(commit.sha)) {
+      checked.add(commit.sha);
+      let exists = await commitExists(commit.sha);
+      if (!exists) {
+        missing.push(commit);
+      }
+    }
+  }
+
   writeJson(missingPath, missing);
   return missing;
 }
@@ -253,12 +273,12 @@ async function missingCommits(items) {
 async function createBranch(branchname, sha) {
   progress(`Creating branch ${branchname}`);
   try {
-    await post(`${config.destination.url}/git/refs`,
-               {
-                 "ref": `refs/heads/${branchname}`,
-                 "sha": sha,
-               },
-               config.destination.default_token);
+    const response = await post(`${config.destination.url}/git/refs`,
+                                {
+                                  "ref": `refs/heads/${branchname}`,
+                                  "sha": sha,
+                                },
+                                config.destination.default_token);
   } catch (e) {
     if (e.response.data.message === "Reference already exists") {
       warn(`Branch #${branchname} already exists. Ignoring...`);
@@ -269,10 +289,11 @@ async function createBranch(branchname, sha) {
 }
 
 function suffix(item) {
-  let suffix = `_Originally authored by ${item.user.login}` +
-    ` on ${new Date(item.created_at).toString()}.`;
+  let suffix = `_[Original](${item.html_url})`;
+  suffix += ` by ${item.user.login}`; // TODO: mention user if not authoring
+  suffix += ` on ${new Date(item.created_at).toString()}.`;
   if (item.closed_at) {
-    suffix += " Closed ";
+    suffix += "\r\n\r\nClosed ";
     if (item.closed_by) {
       suffix += ` by ${item.closed_by.login}`;
     }
@@ -281,23 +302,47 @@ function suffix(item) {
   return suffix + "_";
 }
 
+function branchNames(pull) {
+  return {
+    head: `migrated/pr-${pull.number}/${pull.head.ref}`,
+    base: `migrated/pr-${pull.number}/${pull.base.ref}`,
+  };
+}
+
 async function createPullRequest(pull) {
   progress(`Creating PR #${pull.number}`);
 
-  const headBranch = `pr-${pull.number}-head`;
-  const baseBranch = `pr-${pull.number}-base`;
+  const {head, base} = branchNames(pull);
 
-  await createBranch(headBranch, pull.head.sha);
-  await createBranch(baseBranch, pull.base.sha);
+  await createBranch(head, pull.head.sha);
+  await createBranch(base, pull.base.sha);
 
-  await post(`${config.destination.url}/pulls`,
-             {
-               title: pull.title,
-               body: `${pull.body}\r\n\r\n${suffix(pull)}`,
-               head: headBranch,
-               base: baseBranch,
-             },
-             config.destination.default_token);
+  try {
+    await post(`${config.destination.url}/pulls`,
+               {
+                 title: pull.title,
+                 body: `${pull.body}\r\n\r\n${suffix(pull)}`,
+                 head: head,
+                 base: base,
+               },
+               config.destination.default_token);
+  } catch (e) {
+    if (e.response.status == 422) {
+      console.dir(e.response.data);
+      if (e.response.data.message === "Reference update failed") {
+        warn("Branch creation failed somehow. Retrying ...");
+        sh("sleep 1");
+      } else if (e.response.data.errors[0].message.startsWith("No commits between ")) {
+        warn(`Trying to fix PR #${pull.number}`);
+        sh(`git -C ${cloneDir} pull`);
+        await createBrokenPullRequest(pull);
+      } else {
+        throw e;
+      }
+    } else {
+      throw e;
+    }
+  }
   /* await patch(`${config.destination.url}/pulls/${pull.number}`,
               {
                 state: pull.state,
@@ -307,16 +352,29 @@ async function createPullRequest(pull) {
 }
 
 async function createBrokenPullRequest(pull) {
+  progress(`Creating dummy branches for PR #${pull.number}`);
+
+  const {head, base} = branchNames(pull);
+
+  sh(`git -C ${cloneDir} checkout master`);
+  sh(`git -C ${cloneDir} checkout -B ${base}`);
+  sh(`git -C ${cloneDir} push ${config.destination.repository} ${base}`);
+
+  sh(`git -C ${cloneDir} checkout -B ${head}`);
+  sh(`git -C ${cloneDir} commit --allow-empty --message "Dummy commit for PR #${pull.number}"`);
+  sh(`git -C ${cloneDir} push ${config.destination.repository} ${head}`);
+
+  sh(`git -C ${cloneDir} checkout master`);
+
   progress(`Creating broken PR #${pull.number}`);
   const notice = `_**Note:** the base commit (${pull.base.sha}) is lost,` +
     " so unfortunately we cannot show you the changes added by this PR._";
-  throw "Broken PR!";
   await post(`${config.destination.url}/pulls`,
              {
                title: pull.title,
                body: `${pull.body}\r\n\r\n${suffix(pull)}\r\n\r\n${notice}\r\n\r\n`,
-               head: `pr-${pull.number}-head`,
-               base: `pr-${pull.number}-base`,
+               head: head,
+               base: base,
              },
              config.destination.default_token);
 }
@@ -341,6 +399,9 @@ async function createIssuesAndPulls(issues, missing) {
   log("Creating issues and pull requests");
   const missingHashes = new Set(missing.map(c => c.sha));
   for (let issue of issues) {
+    if (issue.number < 1097) {
+      continue;
+    }
     if (issue.pull_request) {
       if (missingHashes.has(issue.base.sha)) {
         await createBrokenPullRequest(issue);
@@ -401,7 +462,7 @@ async function filterMentions(items) {
       match = regex.exec(body.slice(last));
     }
     parts.push(body.slice(last));
-    item.body = parts.join();
+    item.body = parts.join("");
   }
 
   writeJson(mentionsPath, Array.from(mentions));
@@ -424,10 +485,77 @@ function checkIfNeeded(path) {
  * the 'delete_repositories' scope. Use with caution.
  */
 async function resetDestination() {
-  await destroy(config.destination.url, config.destination.default_token);
+  progress("Deleting destination repository");
+  await destroy(config.destination.url, config.destination.admin_token);
+  progress("Creating destination repository");
   await post(`${config.destination.api}/orgs/${config.destination.owner}/repos`,
-             {name: config.destination.reponame},
+             {name: config.destination.reponame, private: true},
+             config.destination.admin_token);
+}
+
+async function createPullComment(comment) {
+  const pullNumber = comment.pull_request_url.split("/").pop();
+  progress(`Creating review comment for PR #${pullNumber} (${comment.id})`);
+  await post(`${config.destination.url}/pulls/${pullNumber}/comments`,
+             {
+               body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+               commit_id: comment.original_commit_id,
+               path: comment.path,
+               position: comment.original_position,
+
+             },
              config.destination.default_token);
+}
+
+async function createCommitComment(comment) {
+  progress(`Creating commit comment for ${comment.commit_id} (${comment.id})`);
+  await post(`${config.destination.url}/commits/${comment.commit_id}/comments`,
+             {
+               body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+               commit_id: comment.original_commit_id,
+               path: comment.path,
+               position: comment.original_position,
+
+             },
+             config.destination.default_token);
+}
+
+async function createIssueComment(comment) {
+  const issueNumber = comment.issue_url.split("/").pop();
+  progress(`Creating issue comment for #${issueNumber} (${comment.id})`);
+  await post(`${config.destination.url}/issues/${issueNumber}/comments`,
+             {
+               body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+             },
+             config.destination.default_token);
+}
+
+async function createComments(comments, missingCommits) {
+  log("Creating comments");
+  let missingHashes = new Set(missingCommits.map(c => c.sha));
+  for (let comment of comments) {
+    // TODO
+    if (comment.id < 4823) {
+      continue;
+    }
+    if (comment.pull_request_url) {
+      await createPullComment(comment);
+    } else if (comment.commit_id) {
+      if (!missingHashes.has(comment.commit_id)) {
+        await createCommitComment(comment);
+      }
+    } else {
+      await createIssueComment(comment);
+    }
+  }
+}
+
+async function showRateLimit() {
+  const response = await get(config.destination.url,
+                             config.destination.default_token);
+  const remaining = response.headers["x-ratelimit-remaining"];
+  const limit = response.headers["x-ratelimit-limit"];
+  log(`Rate limit: ${remaining}/${limit} remaining`);
 }
 
 (async () => {
@@ -460,8 +588,12 @@ async function resetDestination() {
     const creators = await findCreators(items);
     const mentions = await filterMentions(items);
 
-    await createIssuesAndPulls(issues, missing);
+    // await createIssuesAndPulls(issues, missing);
+    await createComments(comments, missing);
+
+    await showRateLimit();
   } catch (e) {
+    debugger;
     console.dir(e);
   }
 })();
