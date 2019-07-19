@@ -8,38 +8,6 @@ const util = require("util");
 const childProcess = require("child_process");
 const colors = require("colors");
 
-/**
- * Execute in shell, while connecting stdin, stdout and stderr to that of
- * the current process
- */
-function sh(commandline, options) {
-  console.log(commandline);
-  return childProcess.execSync(commandline, {stdio: "inherit", ...options});
-}
-
-function warn(message) {
-  const date = new Date().toISOString().slice(0, 19).replace("T", " ");
-  console.log(`[${date}] ${message}`.red);
-}
-
-function log(message) {
-  const date = new Date().toISOString().slice(0, 19).replace("T", " ");
-  console.log(`[${date}] ${message}`.blue.bold);
-}
-
-function progress(message) {
-  const date = new Date().toISOString().slice(0, 19).replace("T", " ");
-  console.log(`[${date}] ${message}`.blue);
-}
-
-function writeJson(path, object) {
-  fs.writeFileSync(path, JSON.stringify(object, null, 2));
-}
-
-function readJson(path) {
-  return JSON.parse(fs.readFileSync(path));
-}
-
 program.version("0.1.0")
   .option("-c, --config <path>",
           "Configuration file path. Defaults to ./config.yml")
@@ -52,6 +20,38 @@ program.version("0.1.0")
   .option("-o, --overwrite",
           "Overwrites steps if a file already exists instead of resuming.")
   .parse(process.argv);
+
+/**
+ * Execute in shell, while connecting stdin, stdout and stderr to that of
+ * the current process
+ */
+function sh(commandline, options) {
+  console.log(commandline);
+  return childProcess.execSync(commandline, {stdio: "inherit", ...options});
+}
+
+function warn(message) {
+  const date = new Date().toString().slice(0, 24);
+  console.log(`[${date}] ${message}`.red);
+}
+
+function log(message) {
+  const date = new Date().toString().slice(0, 24);
+  console.log(`[${date}] ${message}`.blue.bold);
+}
+
+function progress(message) {
+  const date = new Date().toString().slice(0, 24);
+  console.log(`[${date}] ${message}`.blue);
+}
+
+function writeJson(path, object) {
+  fs.writeFileSync(path, JSON.stringify(object, null, 2));
+}
+
+function readJson(path) {
+  return JSON.parse(fs.readFileSync(path));
+}
 
 const configFile = program.config || "./config.yml";
 const config = yaml.safeLoad(fs.readFileSync(configFile));
@@ -82,9 +82,10 @@ fs.mkdirSync(repoDir, {recursive: true});
 const cloneDir = repoDir + "/clone";
 const mirrorDir = repoDir + "/mirror.git";
 const issuePath = repoDir + "/issues.json";
-const labelPath = repoDir + "/labels.json";
-const commentPath = repoDir + "/comments.json";
+const labelsPath = repoDir + "/labels.json";
 const missingPath = repoDir + "/missing.json";
+const commentPath = repoDir + "/comments.json";
+const releasesPath = repoDir + "/releases.json";
 const mentionsPath = repoDir + "/mentions.json";
 const creatorsPath = repoDir + "/creators.json";
 
@@ -177,7 +178,7 @@ async function fetchIssue(issueNumber) {
   }
 }
 
-async function fetchAllIssues() {
+async function fetchIssues() {
   log("Fetching issues");
   const issues = (await collectUntilNull(fetchIssue))
     .sort((a, b) => a.number - b.number);
@@ -185,41 +186,41 @@ async function fetchAllIssues() {
   return issues;
 }
 
-async function fetchLabels(page) {
-  const response = await get(`${config.source.url}/labels?` +
-                             `page=${page}&per_page=100`);
-  if (response.data.length === 0) {
-    return null;
-  }
-  return response.data;
+
+async function collectPages(type) {
+  return [].concat(...(await collectUntilNull(async page => {
+    const response = await get(`${config.source.url}/${type}?` +
+                               `page=${page}&state=all&per_page=100`);
+    if (response.data.length === 0) {
+      return null;
+    }
+    return response.data;
+  })));
 }
 
-async function fetchAllLabels() {
+
+async function fetchLabels() {
   log("Fetching labels");
-  const labels = [].concat(...(await collectUntilNull(fetchLabels)));
-  writeJson(labelPath, labels);
+  const labels = collectPages("labels");
+  writeJson(labelsPath, labels);
   return labels;
 }
 
-async function fetchCommentPage(type, page) {
-  const response = await get(`${config.source.url}/${type}?` +
-                             `page=${page}&state=all&per_page=100`);
-  if (response.data.length === 0) {
-    return null;
-  }
-  return response.data;
+async function fetchReleases() {
+  log("Fetching releases");
+  const releases = collectPages("releases");
+  writeJson(releasesPath, releases);
+  return releases;
 }
 
-async function fetchCommentsOfType(type) {
-  progress(`Fetching ${type}`);
-  return collectUntilNull(async i => await fetchCommentPage(type, i));
-}
-
-async function fetchAllComments() {
+async function fetchComments() {
   log("Fetching comments");
-  const pullComments = await fetchCommentsOfType("pulls/comments");
-  const issueComments = await fetchCommentsOfType("issues/comments");
-  const commitComments = await fetchCommentsOfType("comments");
+  progress("Fetching pull comments");
+  const pullComments = await collectPages("pulls/comments");
+  progress("Fetching issue comments");
+  const issueComments = await collectPages("issues/comments");
+  progress("Fetching commit comments");
+  const commitComments = await collectPages("comments");
   const comments = []
     .concat(...pullComments)
     .concat(...issueComments)
@@ -647,14 +648,34 @@ async function addLabels(issue) {
               config.destination.default_token);
 }
 
+function mergeUnmergeable(pull) {
+  const {head, base} = branchNames(pull);
+  sh(`git -C ${cloneDir} fetch`);
+  sh(`git -C ${cloneDir} checkout ${base}`);
+  // Merge using the 'ours' strategy, which resolves conflicts for us
+  sh(`git -C ${cloneDir} merge origin/${head} -s ours --no-edit`);
+  sh(`git -C ${cloneDir} push ${config.destination.repository} ${base}`);
+  sh(`git -C ${cloneDir} checkout master`);
+}
+
 async function updatePull(pull) {
   progress(`Updating PR #${pull.number}`);
   await addLabels(pull);
   if (pull.merged) {
     progress(`Merging PR #${pull.number}`);
-    await put(`${config.destination.url}/pulls/${pull.number}/merge`,
-              null,
-              authorToken(pull.closed_by.login));
+    try {
+      await put(`${config.destination.url}/pulls/${pull.number}/merge`,
+                null,
+                authorToken(pull.closed_by.login));
+    } catch (e) {
+      if (e.response.status === 405) {
+        warn("Unmergeable commit encountered, trying to merge manually...");
+        mergeUnmergeable(pull);
+        debugger;
+      } else {
+        throw e;
+      }
+    }
   } else if (pull.state === "closed") {
     await patch(`${config.destination.url}/pulls/${pull.number}`,
                 {
@@ -679,6 +700,9 @@ async function updateIssue(issue) {
 async function updateIssuesAndPulls(issues) {
   log("Updating issues and pull requests");
   for (let issue of issues) {
+    if (issue.number < 743) { //TODO: verder doen vanaf hier?
+      continue;
+    }
     if (issue.pull_request) {
       await updatePull(issue);
     } else {
@@ -697,19 +721,23 @@ function cleanRemoteRepo() {
       await resetDestination();
     }
 
-    moveRepository();
+    //moveRepository();
 
     const issues = checkIfNeeded(issuePath)
-      ? (await fetchAllIssues())
+      ? (await fetchIssues())
       : readJson(issuePath);
 
     const comments = checkIfNeeded(commentPath)
-      ? (await fetchAllComments())
+      ? (await fetchComments())
       : readJson(commentPath);
 
-    const labels = checkIfNeeded(labelPath)
-      ? (await fetchAllLabels())
-      : readJson(labelPath);
+    const labels = checkIfNeeded(labelsPath)
+      ? (await fetchLabels())
+      : readJson(labelsPath);
+
+    const releases = checkIfNeeded(releasesPath)
+      ? (await fetchReleases())
+      : readJson(releasesPath);
 
     const items = issues.concat(comments);
 
@@ -725,9 +753,9 @@ function cleanRemoteRepo() {
     const creators = await findCreators(items);
     const mentions = await filterMentions(items);
 
-    await createLabels(labels);
-    await createIssuesAndPulls(issues, missing);
-    await createComments(comments, missing);
+    //await createLabels(labels);
+    //await createIssuesAndPulls(issues, missing);
+    //await createComments(comments, missing);
 
     await updateIssuesAndPulls(issues);
 
