@@ -201,14 +201,14 @@ async function collectPages(type) {
 
 async function fetchLabels() {
   log("Fetching labels");
-  const labels = collectPages("labels");
+  const labels = await collectPages("labels");
   writeJson(labelsPath, labels);
   return labels;
 }
 
 async function fetchReleases() {
   log("Fetching releases");
-  const releases = collectPages("releases");
+  const releases = await collectPages("releases");
   writeJson(releasesPath, releases);
   return releases;
 }
@@ -427,9 +427,14 @@ async function createBrokenPullRequest(pull) {
   sh(`git -C ${cloneDir} push ${config.destination.repository} ${base}`);
 
   sh(`git -C ${cloneDir} checkout -B ${head}`);
-  sh(`git -C ${cloneDir} commit --allow-empty --message "Dummy commit for PR #${pull.number}"`);
-  sh(`git -C ${cloneDir} push ${config.destination.repository} ${head}`);
 
+  const authorName = config.destination.committer_name;
+  const authorEmail = config.destination.committer_email;
+  sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}"` +
+     `GIT_AUTHOR_NAME="${authorName}" GIT_AUTHOR_EMAIL="${authorEmail}" ` +
+     `git -C ${cloneDir} commit --allow-empty --message "Dummy commit for PR #${pull.number}"`);
+
+  sh(`git -C ${cloneDir} push ${config.destination.repository} ${head}`);
   sh(`git -C ${cloneDir} checkout master`);
 
   progress(`Creating broken PR #${pull.number}`);
@@ -616,17 +621,13 @@ async function createLabels(labels) {
     description: "This item originates from the migrated github.ugent.be repository",
   });
   for (let label of labels) {
-    try {
-      await post(`${config.destination.url}/labels`,
-                 {
-                   name: label.name,
-                   color: label.color,
-                   description: label.description,
-                 },
-                 config.destination.default_token);
-    } catch (e) {
-      debugger;
-    }
+    await post(`${config.destination.url}/labels`,
+               {
+                 name: label.name,
+                 color: label.color,
+                 description: label.description,
+               },
+               config.destination.default_token);
   }
 }
 
@@ -652,8 +653,14 @@ function mergeUnmergeable(pull) {
   const {head, base} = branchNames(pull);
   sh(`git -C ${cloneDir} fetch`);
   sh(`git -C ${cloneDir} checkout ${base}`);
+
   // Merge using the 'ours' strategy, which resolves conflicts for us
-  sh(`git -C ${cloneDir} merge origin/${head} -s ours --no-edit`);
+  const authorName = config.destination.committer_name;
+  const authorEmail = config.destination.committer_email;
+  sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}"` +
+     `GIT_AUTHOR_NAME="${authorName} GIT_AUTHOR_EMAIL=${authorEmail}" ` +
+     `git -C ${cloneDir} merge origin/${head} -s ours --no-edit`);
+
   sh(`git -C ${cloneDir} push ${config.destination.repository} ${base}`);
   sh(`git -C ${cloneDir} checkout master`);
 }
@@ -671,7 +678,6 @@ async function updatePull(pull) {
       if (e.response.status === 405) {
         warn("Unmergeable commit encountered, trying to merge manually...");
         mergeUnmergeable(pull);
-        debugger;
       } else {
         throw e;
       }
@@ -682,6 +688,22 @@ async function updatePull(pull) {
                   state: pull.state,
                 },
                 authorToken(pull.closed_by.login));
+  }
+}
+
+async function createReleases(releases) {
+  log("Creating releases");
+  for (let release of releases) {
+    progress(`Creating release ${release.name}`);
+    await post(`${config.destination.url}/releases`,
+               {
+                 name: release.name,
+                 tag_name: release.tag_name,
+                 body: release.body,
+                 draft: release.draft,
+                 prerelease: release.prerelease,
+               },
+               authorToken(release.author.login));
   }
 }
 
@@ -700,9 +722,6 @@ async function updateIssue(issue) {
 async function updateIssuesAndPulls(issues) {
   log("Updating issues and pull requests");
   for (let issue of issues) {
-    if (issue.number < 743) { //TODO: verder doen vanaf hier?
-      continue;
-    }
     if (issue.pull_request) {
       await updatePull(issue);
     } else {
@@ -712,6 +731,7 @@ async function updateIssuesAndPulls(issues) {
 }
 
 function cleanRemoteRepo() {
+  log("Clean destination remote of temporary branches");
   sh(`git -C ${mirrorDir} push --mirror ${config.destination.repository}`);
 }
 
@@ -721,7 +741,7 @@ function cleanRemoteRepo() {
       await resetDestination();
     }
 
-    //moveRepository();
+    moveRepository();
 
     const issues = checkIfNeeded(issuePath)
       ? (await fetchIssues())
@@ -753,17 +773,17 @@ function cleanRemoteRepo() {
     const creators = await findCreators(items);
     const mentions = await filterMentions(items);
 
-    //await createLabels(labels);
-    //await createIssuesAndPulls(issues, missing);
-    //await createComments(comments, missing);
+    await createLabels(labels);
+    await createIssuesAndPulls(issues, missing);
+    await createComments(comments, missing);
 
     await updateIssuesAndPulls(issues);
+    await createReleases(releases);
 
     cleanRemoteRepo();
 
     await showRateLimit();
   } catch (e) {
-    debugger;
     console.dir(e);
   }
 })();
