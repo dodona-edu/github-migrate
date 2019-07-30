@@ -1,11 +1,18 @@
 {
-    "parserOptions": {
-        "ecmaVersion": 2019,
+        "parser": "@typescript-eslint/parser",
+        "plugins": ["@typescript-eslint"],
+        "parserOptions": {
+            "ecmaVersion": 2019,
             "sourceType": "module"
-    },
-        "extends": ["eslint:recommended", "google"],
-        //"plugins": ["import"],
+        },
+        "extends": [
+            "eslint:recommended",
+            "plugin:@typescript-eslint/eslint-recommended",
+            "plugin:@typescript-eslint/recommended",
+            ],
         "rules": {
+            "@typescript-eslint/indent": ["error", 2, {"CallExpression": {"arguments": "first"}}],
+            "@typescript-eslint/explicit-function-return-type": {"allowExpressions": true},
             "arrow-parens": ["error", "as-needed"],
             "no-underscore-dangle": "off",
             "no-use-before-define": "off",
@@ -18,7 +25,6 @@
             "valid-jsdoc": "off",
             "space-before-function-paren": ["error", {"anonymous": "always", "named": "never", "asyncArrow": "always"}],
             "no-param-reassign": ["error", { "props": false }],
-            "indent": ["error", 2, {"CallExpression": {"arguments": "first"}}],
             "max-len": "off",
             "quotes": ["error", "double"],
             "new-cap": "off",
