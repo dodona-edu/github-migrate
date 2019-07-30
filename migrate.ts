@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env ts-node
 
 import { default as colors } from "colors/safe";
 import { default as childProcess } from "child_process";
@@ -48,7 +48,7 @@ function progress(message: string): void {
   console.log(colors.blue(`[${date}] ${message}`));
 }
 
-function writeJson(path: string, item): void {
+function writeJson(path: string, item: object): void {
   fs.writeFileSync(path, JSON.stringify(item, null, 2));
 }
 
@@ -60,46 +60,79 @@ interface Repository {
   remote: string;
   owner: string;
   name: string;
+  url: string;
 }
 
 function parseRepoUrl(cloneUrl: string): Repository {
   const matchSsh = /^git@([^:]+):([^/]+)\/(.+)\.git$/.exec(cloneUrl);
   if (matchSsh) {
-    return {remote: matchSsh[1], owner: matchSsh[2], name: matchSsh[3]};
+    return {remote: matchSsh[1], owner: matchSsh[2], name: matchSsh[3], url: cloneUrl};
   }
   const matchHttp = /^https?:\/\/([^/]+)\/([^/]+)\/(.+)\.git$/.exec(cloneUrl);
   if (matchHttp) {
-    return {remote: matchHttp[1], owner: matchHttp[2], name: matchHttp[3]};
+    return {remote: matchHttp[1], owner: matchHttp[2], name: matchHttp[3], url: cloneUrl};
   }
   throw `Repository '${cloneUrl}' is not in ssh or https format.`;
 }
 
+type Token = string;
+
+interface Config {
+  source: SourceConfig;
+  destination: DestinationConfig;
+}
+
+interface SourceConfig {
+  url: URL;
+  api: URL;
+  repo: Repository;
+  token: Token;
+}
+
+interface DestinationConfig {
+  url: URL;
+  api: URL;
+  repo: Repository;
+  default_token: Token;
+  admin_token: Token;
+  committer_name: string;
+  committer_email: string;
+  usernames: StringMap<string>;
+  tokens: StringMap<Token>;
+}
+
+interface StringMap<T> {
+  [key: string]: T;
+}
 
 const configFile = program.config || "./config.yml";
-const config = yaml.safeLoad(fs.readFileSync(configFile));
+const cfgObj = yaml.safeLoad(fs.readFileSync(configFile).toString());
 
 /* eslint @typescript-eslint/camelcase: "off"*/
-config.destination.admin_token = config.destination.admin_token || config.destination.default_token;
+cfgObj.destination.admin_token = cfgObj.destination.admin_token || cfgObj.destination.default_token;
 
-config.source.repository = program.source || config.source.repository;
-config.destination.repository = program.source || config.destination.repository;
+cfgObj.source.repository = program.source || cfgObj.source.repository;
+cfgObj.destination.repository = program.source || cfgObj.destination.repository;
 
-const sourceInfo = parseRepoUrl(config.source.repository);
-const destInfo = parseRepoUrl(config.destination.repository);
+const srcRepo = parseRepoUrl(cfgObj.source.repository);
+const dstRepo = parseRepoUrl(cfgObj.destination.repository);
 
-config.source = {
-  url: `${config.source.api}/repos/${sourceInfo.owner}/${sourceInfo.name}`,
-  ...config.source,
-  ...sourceInfo,
-};
+const config: Config = {
+  source: {
+    url: `${cfgObj.source.api}/repos/${srcRepo.owner}/${srcRepo.name}`,
+    repo: srcRepo,
+    ...cfgObj.source,
+  },
+  destination: {
+    url: `${cfgObj.destination.api}/repos/${dstRepo.owner}/${dstRepo.name}`,
+    repo: dstRepo,
+    ...cfgObj.destination,
+  }
+}
 
-config.destination = {
-  url: `${config.destination.api}/repos/${destInfo.owner}/${destInfo.name}`,
-  ...config.destination,
-  ...destInfo,
-};
 
-const repoDir = "data/" + config.source.reponame;
+
+const repoDir = "data/" + config.source.repo.name;
 fs.mkdirSync(repoDir, {recursive: true});
 
 const cloneDir = repoDir + "/clone";
@@ -112,7 +145,7 @@ const releasesPath = repoDir + "/releases.json";
 const mentionsPath = repoDir + "/mentions.json";
 const creatorsPath = repoDir + "/creators.json";
 
-async function invoke(method: Method, url: string, data?: object, token?: string): Promise<AxiosResponse> {
+async function invoke(method: Method, url: string, token?: Token, data?: object): Promise<AxiosResponse> {
   try {
     return await axios.request({
       method: method,
@@ -129,31 +162,31 @@ async function invoke(method: Method, url: string, data?: object, token?: string
         response.headers["x-ratelimit-remaining"] == 0) {
       warn("Ratelimit encountered, retrying in 1 second");
       sh("sleep 1");
-      return await invoke(method, url, data, token);
+      return await invoke(method, url, token, data);
     } else {
       throw e;
     }
   }
 }
 
-function get(url: string, token?: string): Promise<AxiosResponse> {
-  return invoke("get", url, null, token);
+function get(url: URL, token?: Token): Promise<AxiosResponse> {
+  return invoke("get", url, token);
 }
 
-function destroy(url: string, token?: string): Promise<AxiosResponse> {
-  return invoke("delete", url, null, token);
+function destroy(url: URL, token?: Token): Promise<AxiosResponse> {
+  return invoke("delete", url, token);
 }
 
-function patch(url, data, token?): Promise<AxiosResponse> {
-  return invoke("patch", url, data, token);
+function patch(url: URL, data: object, token?: Token): Promise<AxiosResponse> {
+  return invoke("patch", url, token, data);
 }
 
-function post(url, data, token?): Promise<AxiosResponse> {
-  return invoke("post", url, data, token);
+function post(url: URL, data: object, token?: Token): Promise<AxiosResponse> {
+  return invoke("post", url, token, data);
 }
 
-function put(url, data, token?): Promise<AxiosResponse> {
-  return invoke("put", url, data, token);
+function put(url: URL, data: object, token?: Token): Promise<AxiosResponse> {
+  return invoke("put", url, token, data);
 }
 
 
@@ -163,10 +196,10 @@ function put(url, data, token?): Promise<AxiosResponse> {
  * collecting the result in an array. Continues until the callback returns
  * null.
  */
-async function collectUntilNull<T>(callback: (number) => Promise<T | null>)
+async function collectUntilNull<T>(callback: (n: number) => Promise<T | null>)
   : Promise<T[]>  {
   let i = 1;
-  const collector = [];
+  const collector: T[] = [];
   let result = await callback(i);
   while (result) {
     i += 1;
@@ -190,12 +223,12 @@ type URL = string;
 interface Item {
   id: number;
   url: URL;
-  html_url: URL;
   created_at: Date;
 }
 
 interface Authorable extends Item {
   user: User;
+  html_url: URL;
   body: string;
 }
 
@@ -208,6 +241,7 @@ function isAuthorable(item: Item): item is Authorable  {
 interface Issue extends Authorable {
   number: number;
   title: string;
+  state: string;
   events_url: URL;
   closed_by: User;
   closed_at: Date;
@@ -218,15 +252,15 @@ function isIssue(item: Item): item is Issue {
   return (item as Issue).labels !== undefined;
 }
 
-interface PRIssue extends Issue {
+interface PullRequest extends Issue {
   pull_request: object;
   base: Commit;
   head: Commit;
   merged: boolean;
 }
 
-function isPR(item: Item): item is PRIssue  {
-  return (item as PRIssue).pull_request !== undefined;
+function isPR(item: Item): item is PullRequest  {
+  return (item as PullRequest).pull_request !== undefined;
 }
 
 interface Comment extends Authorable {
@@ -237,17 +271,23 @@ interface User {
   login: string;
 }
 
-interface Release extends Authorable {
+interface Release extends Item {
   name: string;
-  tag: string;
+  body: string;
+  tag_name: string;
+  draft: boolean;
+  prerelease: boolean;
+  author: User;
 }
 
 interface Label extends Item {
   name: string;
   color: string;
+  description: string;
 }
 
 interface Commit {
+  ref?: string;
   url: string;
   sha: string;
 }
@@ -281,7 +321,11 @@ function isIssueComment(item: Item): item is IssueComment {
   return (item as IssueComment).issue_url !== undefined;
 }
 
-async function fetchIssue(issueNumber): Promise<Issue> {
+interface Event {
+  event: string;
+}
+
+async function fetchIssue(issueNumber: number): Promise<Issue | null> {
   progress(`Fetching issue ${issueNumber}`);
   try {
     const request = await get(`${config.source.url}/issues/${issueNumber}`);
@@ -292,7 +336,7 @@ async function fetchIssue(issueNumber): Promise<Issue> {
       issue.base = pull.base;
       issue.head = pull.head;
 
-      const events = (await get(issue.events_url)).data;
+      const events: Event[] = (await get(issue.events_url)).data;
       issue.merged = events.some(e => e.event === "merged");
     }
 
@@ -314,7 +358,7 @@ async function fetchIssues(): Promise<Issue[]> {
 }
 
 
-async function collectPages<T>(type): Promise<T[]> {
+async function collectPages<T>(type: string): Promise<T[]> {
   return [].concat(...(await collectUntilNull(async page => {
     const response = await get(`${config.source.url}/${type}?` +
                                `page=${page}&state=all&per_page=100`);
@@ -342,12 +386,12 @@ async function fetchReleases(): Promise<Release[]> {
 async function fetchComments(): Promise<Comment[]> {
   log("Fetching comments");
   progress("Fetching pull comments");
-  const pullComments = await collectPages("pulls/comments");
+  const pullComments = await collectPages<PRComment>("pulls/comments");
   progress("Fetching issue comments");
-  const issueComments = await collectPages("issues/comments");
+  const issueComments = await collectPages<IssueComment>("issues/comments");
   progress("Fetching commit comments");
-  const commitComments = await collectPages("comments");
-  const comments = []
+  const commitComments = await collectPages<CommitComment>("comments");
+  const comments = ([] as Comment[])
     .concat(...pullComments)
     .concat(...issueComments)
     .concat(...commitComments)
@@ -373,18 +417,18 @@ function moveRepository(): void {
   log("Mirroring repository");
   if (checkIfNeeded(mirrorDir)) {
     progress("Creating mirror from source");
-    sh(`git clone --mirror ${config.source.repository} ${mirrorDir}`);
-    sh(`git -C ${mirrorDir} remote set-url origin ${config.destination.repository}`);
-    sh(`git -C ${mirrorDir} remote set-url --push origin ${config.destination.repository}`);
+    sh(`git clone --mirror ${config.source.repo.url} ${mirrorDir}`);
+    sh(`git -C ${mirrorDir} remote set-url origin ${config.destination.repo.url}`);
+    sh(`git -C ${mirrorDir} remote set-url --push origin ${config.destination.repo.url}`);
     progress("Replacing packed-refs");
     sh(`sed -i.bak 's_ refs/pull/_ refs/pr/_' ${mirrorDir}/packed-refs`);
   }
   progress("Pushing to destination");
-  sh(`git -C ${mirrorDir} push --mirror ${config.destination.repository}`);
+  sh(`git -C ${mirrorDir} push --mirror ${config.destination.repo.url}`);
 
   if (checkIfNeeded(cloneDir)) {
     progress("Creating clone from destination");
-    sh(`git clone ${config.destination.repository} ${cloneDir}`);
+    sh(`git clone ${config.destination.repo.url} ${cloneDir}`);
   }
 }
 
@@ -402,24 +446,23 @@ async function commitExists(sha: string): Promise<boolean> {
   }
 }
 
-
-async function missingCommits(items): Promise<Commit[]> {
+async function missingCommits(items: Item[]): Promise<Commit[]> {
   const commits = items
     .map((item): Commit | null => {
-      if (item.base) { // Pull Request
+      if (isPR(item)) { // Pull Request
         return {url: item.html_url, sha: item.base.sha};
-      } else if (item.pull_request_url) { // Review comment
-        return {url: item.html_url, sha: item.original_commit_id};
-      } else if (item.commit_id) { // Commit comment
+      //} else if (item.pull_request_url) { // Review comment
+       // return {url: item.html_url, sha: item.original_commit_id};
+      } else if (isCommitComment(item)) { // Commit comment
         return {url: item.html_url, sha: item.commit_id};
       } else {
         return null;
       }
     })
-    .filter((item): boolean => item !== null);
+    .filter((item): item is Commit => item !== null);
 
   const checked = new Set();
-  const missing = [];
+  const missing: Commit[] = [];
   for (const commit of commits) {
     if (!checked.has(commit.sha)) {
       checked.add(commit.sha);
@@ -434,7 +477,7 @@ async function missingCommits(items): Promise<Commit[]> {
   return missing;
 }
 
-async function createBranch(branchname, sha): Promise<void> {
+async function createBranch(branchname: string, sha: string): Promise<void> {
   progress(`Creating branch ${branchname}`);
   try {
     await post(`${config.destination.url}/git/refs`,
@@ -459,12 +502,12 @@ function formatDate(date: Date): string {
   return `${day} at ${time}`;
 }
 
-function authorToken(srcUser: string): string {
-  const token = config.destination.tokens[srcUser];
+function authorToken(srcUser: User): string {
+  const token = config.destination.tokens[srcUser.login];
   if (!token) {
-    warn(`Missing token for ${srcUser}, using default token`);
+    warn(`Missing token for ${srcUser.login}, using default token`);
   }
-  if (srcUser === "rbmaerte") { // TODO: turn on for all users
+  if (srcUser.login === "rbmaerte") { // TODO: turn on for all users
     return token || config.destination.default_token;
   } else {
     return config.destination.default_token;
@@ -504,21 +547,21 @@ interface BranchNames {
   base: string;
 }
 
-function branchNames(pull): BranchNames {
+function branchNames(pull: PullRequest): BranchNames {
   return {
     head: `migrated/pr-${pull.number}/${pull.head.ref}`,
     base: `migrated/pr-${pull.number}/${pull.base.ref}`,
   };
 }
 
-async function createBrokenPullRequest(pull): Promise<void> {
+async function createBrokenPullRequest(pull: PullRequest): Promise<void> {
   progress(`Creating dummy branches for PR #${pull.number}`);
 
   const {head, base} = branchNames(pull);
 
   sh(`git -C ${cloneDir} checkout master`);
   sh(`git -C ${cloneDir} checkout -B ${base}`);
-  sh(`git -C ${cloneDir} push ${config.destination.repository} ${base}`);
+  sh(`git -C ${cloneDir} push ${config.destination.repo.url} ${base}`);
 
   sh(`git -C ${cloneDir} checkout -B ${head}`);
 
@@ -528,7 +571,7 @@ async function createBrokenPullRequest(pull): Promise<void> {
      `GIT_AUTHOR_NAME="${authorName}" GIT_AUTHOR_EMAIL="${authorEmail}" ` +
      `git -C ${cloneDir} commit --allow-empty --message "Dummy commit for PR #${pull.number}"`);
 
-  sh(`git -C ${cloneDir} push ${config.destination.repository} ${head}`);
+  sh(`git -C ${cloneDir} push ${config.destination.repo.url} ${head}`);
   sh(`git -C ${cloneDir} checkout master`);
 
   progress(`Creating broken PR #${pull.number}`);
@@ -541,10 +584,10 @@ async function createBrokenPullRequest(pull): Promise<void> {
                head: head,
                base: base,
              },
-             authorToken(pull.user.login));
+             authorToken(pull.user));
 }
 
-async function createPullRequest(pull): Promise<void> {
+async function createPullRequest(pull: PullRequest): Promise<void> {
   progress(`Creating PR #${pull.number}`);
 
   let head, base;
@@ -565,7 +608,7 @@ async function createPullRequest(pull): Promise<void> {
                  head: head,
                  base: base,
                },
-               authorToken(pull.user.login));
+               authorToken(pull.user));
   } catch (e) {
     if (e.response.status == 422) {
       console.dir(e.response.data);
@@ -592,7 +635,7 @@ async function createIssue(issue: Issue): Promise<void> {
                title: issue.title,
                body: `${issue.body}\r\n\r\n${suffix(issue)}`,
              },
-             authorToken(issue.user.login));
+             authorToken(issue.user));
 }
 
 async function createIssuesAndPulls(issues: Issue[], missing: Commit[]): Promise<void> {
@@ -626,7 +669,7 @@ async function filterMentions(items: Authorable[]): Promise<Map<string, string>>
   for (const item of items) {
     const body = item.body;
 
-    const parts = [];
+    const parts: string[] = [];
 
     let last = 0;
     let match = regex.exec(body);
@@ -668,10 +711,14 @@ async function filterMentions(items: Authorable[]): Promise<Map<string, string>>
  */
 async function resetDestination(): Promise<void> {
   progress("Deleting destination repository");
-  await destroy(config.destination.url, config.destination.admin_token);
+  try {
+    await destroy(config.destination.url, config.destination.admin_token);
+  } catch (e) {
+    warn(e);
+  }
   progress("Creating destination repository");
-  await post(`${config.destination.api}/orgs/${config.destination.owner}/repos`,
-             {name: config.destination.reponame, private: true},
+  await post(`${config.destination.api}/orgs/${config.destination.repo.owner}/repos`,
+             {name: config.destination.repo.name, private: true},
              config.destination.admin_token);
 }
 
@@ -686,7 +733,7 @@ async function createPullComment(comment: PRComment): Promise<void> {
                  path: comment.path,
                  position: comment.original_position,
                },
-               authorToken(comment.user.login));
+               authorToken(comment.user));
   } catch (e) {
     if (e.response.status == 422 &&
         e.response.data.errors[0].message.endsWith("is not part of the pull request")) {
@@ -707,7 +754,7 @@ async function createCommitComment(comment: CommitComment): Promise<void> {
                position: comment.original_position,
 
              },
-             authorToken(comment.user.login));
+             authorToken(comment.user));
 }
 
 async function createIssueComment(comment: IssueComment): Promise<void> {
@@ -717,10 +764,10 @@ async function createIssueComment(comment: IssueComment): Promise<void> {
              {
                body: `${comment.body}\r\n\r\n${suffix(comment)}`,
              },
-             authorToken(comment.user.login));
+             authorToken(comment.user));
 }
 
-async function createComments(comments, missingCommits): Promise<void> {
+async function createComments(comments: Comment[], missingCommits: Commit[]): Promise<void> {
   log("Creating comments");
   const missingHashes = new Set(missingCommits.map(c => c.sha));
   for (const comment of comments) {
@@ -738,21 +785,25 @@ async function createComments(comments, missingCommits): Promise<void> {
   }
 }
 
-async function createLabels(labels): Promise<void> {
+async function createLabels(labels: Label[]): Promise<void> {
   log("Creating labels");
   labels.push({
     name: "migrated",
     color: "8fbcea",
     description: "This item originates from the migrated github.ugent.be repository",
-  });
+  } as Label);
   for (const label of labels) {
-    await post(`${config.destination.url}/labels`,
-               {
-                 name: label.name,
-                 color: label.color,
-                 description: label.description,
-               },
-               config.destination.default_token);
+    try {
+      await post(`${config.destination.url}/labels`,
+                 {
+                   name: label.name,
+                   color: label.color,
+                   description: label.description,
+                 },
+                 config.destination.default_token);
+    } catch(e) {
+      debugger;
+    }
   }
 }
 
@@ -774,7 +825,7 @@ async function addLabels(issue: Issue): Promise<void> {
               config.destination.default_token);
 }
 
-function mergeUnmergeable(pull) {
+function mergeUnmergeable(pull: PullRequest) {
   const {head, base} = branchNames(pull);
   sh(`git -C ${cloneDir} fetch`);
   sh(`git -C ${cloneDir} checkout ${base}`);
@@ -786,19 +837,19 @@ function mergeUnmergeable(pull) {
      `GIT_AUTHOR_NAME="${authorName} GIT_AUTHOR_EMAIL=${authorEmail}" ` +
      `git -C ${cloneDir} merge origin/${head} -s ours --no-edit`);
 
-  sh(`git -C ${cloneDir} push ${config.destination.repository} ${base}`);
+  sh(`git -C ${cloneDir} push ${config.destination.repo.url} ${base}`);
   sh(`git -C ${cloneDir} checkout master`);
 }
 
-async function updatePull(pull) {
+async function updatePull(pull: PullRequest) {
   progress(`Updating PR #${pull.number}`);
   await addLabels(pull);
   if (pull.merged) {
     progress(`Merging PR #${pull.number}`);
     try {
       await put(`${config.destination.url}/pulls/${pull.number}/merge`,
-                null,
-                authorToken(pull.closed_by.login));
+                {},
+                authorToken(pull.closed_by));
     } catch (e) {
       if (e.response.status === 405) {
         warn("Unmergeable commit encountered, trying to merge manually...");
@@ -812,11 +863,11 @@ async function updatePull(pull) {
                 {
                   state: pull.state,
                 },
-                authorToken(pull.closed_by.login));
+                authorToken(pull.closed_by));
   }
 }
 
-async function createReleases(releases) {
+async function createReleases(releases: Release[]) {
   log("Creating releases");
   for (let release of releases) {
     progress(`Creating release ${release.name}`);
@@ -828,11 +879,11 @@ async function createReleases(releases) {
                  draft: release.draft,
                  prerelease: release.prerelease,
                },
-               authorToken(release.author.login));
+               authorToken(release.author));
   }
 }
 
-async function updateIssue(issue) {
+async function updateIssue(issue: Issue) {
   progress(`Updating issue #${issue.number}`);
   await addLabels(issue);
   if (issue.state === "closed") {
@@ -840,14 +891,14 @@ async function updateIssue(issue) {
                 {
                   state: issue.state,
                 },
-                authorToken(issue.closed_by.login));
+                authorToken(issue.closed_by));
   }
 }
 
-async function updateIssuesAndPulls(issues) {
+async function updateIssuesAndPulls(issues: Issue[]) {
   log("Updating issues and pull requests");
   for (let issue of issues) {
-    if (issue.pull_request) {
+    if (isPR(issue)) {
       await updatePull(issue);
     } else {
       await updateIssue(issue);
@@ -857,7 +908,7 @@ async function updateIssuesAndPulls(issues) {
 
 function cleanRemoteRepo() {
   log("Clean destination remote of temporary branches");
-  sh(`git -C ${mirrorDir} push --mirror ${config.destination.repository}`);
+  sh(`git -C ${mirrorDir} push --mirror ${config.destination.repo.url}`);
 }
 
 (async () => {
@@ -884,7 +935,7 @@ function cleanRemoteRepo() {
       ? (await fetchReleases())
       : readJson<Release[]>(releasesPath);
 
-    const items: Authorable[] = [].concat(issues, comments);
+    const items = (issues as Authorable []).concat(comments);
 
     const missing = checkIfNeeded(missingPath)
       ? (await missingCommits(items))
@@ -895,8 +946,8 @@ function cleanRemoteRepo() {
       console.dir(missing);
     }
 
-    const creators = await findCreators(items);
-    const mentions = await filterMentions(items);
+    // await findCreators(items);
+    await filterMentions(items);
 
     await createLabels(labels);
     await createIssuesAndPulls(issues, missing);
