@@ -12,7 +12,7 @@
             ],
         "rules": {
             "@typescript-eslint/indent": ["error", 2, {"CallExpression": {"arguments": "first"}}],
-            "@typescript-eslint/explicit-function-return-type": {"allowExpressions": true},
+            "@typescript-eslint/explicit-function-return-type": ["error", {"allowExpressions": true}],
             "arrow-parens": ["error", "as-needed"],
             "no-underscore-dangle": "off",
             "no-use-before-define": "off",

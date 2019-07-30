@@ -147,6 +147,7 @@ const creatorsPath = repoDir + "/creators.json";
 
 async function invoke(method: Method, url: string, token?: Token, data?: object): Promise<AxiosResponse> {
   try {
+    console.log(method, url);
     return await axios.request({
       method: method,
       url: url,
@@ -196,8 +197,9 @@ function put(url: URL, data: object, token?: Token): Promise<AxiosResponse> {
  * collecting the result in an array. Continues until the callback returns
  * null.
  */
-async function collectUntilNull<T>(callback: (n: number) => Promise<T | null>)
-  : Promise<T[]>  {
+async function collectUntilNull<T>(
+  callback: (n: number) => Promise<T | null>
+): Promise<T[]>  {
   let i = 1;
   const collector: T[] = [];
   let result = await callback(i);
@@ -280,7 +282,7 @@ interface Release extends Item {
   author: User;
 }
 
-interface Label extends Item {
+interface Label {
   name: string;
   color: string;
   description: string;
@@ -325,22 +327,47 @@ interface Event {
   event: string;
 }
 
+interface Review extends Authorable {
+  commit_id: string;
+  state: string;
+}
+
+async function collectPages<T>(type: string): Promise<T[]> {
+  return [].concat(...(await collectUntilNull(async page => {
+    const response = await get(`${config.source.url}/${type}?` +
+                               `page=${page}&state=all&per_page=100`);
+    if (response.data.length === 0) {
+      return null;
+    }
+    return response.data;
+  })));
+}
+
+async function fetchPR(issue: Issue): Promise<PullRequest> {
+  const pr = (await get(`${config.source.url}/pulls/${issue.number}`)).data;
+  const events: Event[] = (await get(issue.events_url)).data;
+  const reviews = await collectPages<Review>(`pulls/${issue.number}/reviews`);
+
+  return {
+    ...issue,
+    ...pr,
+    reviews: reviews,
+    merged: events.some(e => e.event === "merged")
+  };
+}
+
 async function fetchIssue(issueNumber: number): Promise<Issue | null> {
   progress(`Fetching issue ${issueNumber}`);
   try {
     const request = await get(`${config.source.url}/issues/${issueNumber}`);
-
     const issue = request.data as Issue;
-    if (isPR(issue)) {
-      const pull = (await get(`${config.source.url}/pulls/${issueNumber}`)).data;
-      issue.base = pull.base;
-      issue.head = pull.head;
 
-      const events: Event[] = (await get(issue.events_url)).data;
-      issue.merged = events.some(e => e.event === "merged");
+    if (isPR(issue)) {
+      return await fetchPR(issue);
+    } else {
+      return issue;
     }
 
-    return issue;
   } catch (e) {
     if (e.response && e.response.status === 404) {
       return null;
@@ -355,18 +382,6 @@ async function fetchIssues(): Promise<Issue[]> {
     .sort((a, b) => a.number - b.number);
   writeJson(issuePath, issues);
   return issues;
-}
-
-
-async function collectPages<T>(type: string): Promise<T[]> {
-  return [].concat(...(await collectUntilNull(async page => {
-    const response = await get(`${config.source.url}/${type}?` +
-                               `page=${page}&state=all&per_page=100`);
-    if (response.data.length === 0) {
-      return null;
-    }
-    return response.data;
-  })));
 }
 
 async function fetchLabels(): Promise<Label[]> {
@@ -452,7 +467,7 @@ async function missingCommits(items: Item[]): Promise<Commit[]> {
       if (isPR(item)) { // Pull Request
         return {url: item.html_url, sha: item.base.sha};
       //} else if (item.pull_request_url) { // Review comment
-       // return {url: item.html_url, sha: item.original_commit_id};
+      // return {url: item.html_url, sha: item.original_commit_id};
       } else if (isCommitComment(item)) { // Commit comment
         return {url: item.html_url, sha: item.commit_id};
       } else {
@@ -532,11 +547,9 @@ function suffix(item: Authorable): string {
   let suffix = `_[Original ${type}](${item.html_url})`;
   suffix += ` by ${author(item.user)}`;
   suffix += ` on ${formatDate(item.created_at)}._`;
-  if (isIssue(item)) {
-    suffix += `\n_${isPR(item) ? "Merged" : "Closed"} `;
-    if (isIssue(item)) {
-      suffix += ` by ${author(item.closed_by)}`;
-    }
+  if (isIssue(item) && item.state === "closed") {
+    suffix += `\n_${isPR(item) ? "Merged" : "Closed"} `
+    suffix += `by ${author(item.closed_by)}`;
     suffix += ` on ${formatDate(item.closed_at)}._`;
   }
   return suffix;
@@ -737,7 +750,7 @@ async function createPullComment(comment: PRComment): Promise<void> {
   } catch (e) {
     if (e.response.status == 422 &&
         e.response.data.errors[0].message.endsWith("is not part of the pull request")) {
-      warn("Ignoring review comment because the original commit is gone. (This is normal)");
+      warn("Ignoring review comment because the original commit is gone.");
     } else {
       throw e;
     }
@@ -791,7 +804,7 @@ async function createLabels(labels: Label[]): Promise<void> {
     name: "migrated",
     color: "8fbcea",
     description: "This item originates from the migrated github.ugent.be repository",
-  } as Label);
+  });
   for (const label of labels) {
     try {
       await post(`${config.destination.url}/labels`,
@@ -801,8 +814,12 @@ async function createLabels(labels: Label[]): Promise<void> {
                    description: label.description,
                  },
                  config.destination.default_token);
-    } catch(e) {
-      debugger;
+    } catch (e) {
+      if (e.response.status == 422) {
+        warn(`Label ${label.name} already exists`);
+      } else {
+        throw e;
+      }
     }
   }
 }
@@ -825,7 +842,7 @@ async function addLabels(issue: Issue): Promise<void> {
               config.destination.default_token);
 }
 
-function mergeUnmergeable(pull: PullRequest) {
+function mergeUnmergeable(pull: PullRequest): void {
   const {head, base} = branchNames(pull);
   sh(`git -C ${cloneDir} fetch`);
   sh(`git -C ${cloneDir} checkout ${base}`);
@@ -841,7 +858,7 @@ function mergeUnmergeable(pull: PullRequest) {
   sh(`git -C ${cloneDir} checkout master`);
 }
 
-async function updatePull(pull: PullRequest) {
+async function updatePull(pull: PullRequest): Promise<void> {
   progress(`Updating PR #${pull.number}`);
   await addLabels(pull);
   if (pull.merged) {
@@ -867,9 +884,9 @@ async function updatePull(pull: PullRequest) {
   }
 }
 
-async function createReleases(releases: Release[]) {
+async function createReleases(releases: Release[]): Promise<void> {
   log("Creating releases");
-  for (let release of releases) {
+  for (const release of releases) {
     progress(`Creating release ${release.name}`);
     await post(`${config.destination.url}/releases`,
                {
@@ -883,7 +900,7 @@ async function createReleases(releases: Release[]) {
   }
 }
 
-async function updateIssue(issue: Issue) {
+async function updateIssue(issue: Issue): Promise<void> {
   progress(`Updating issue #${issue.number}`);
   await addLabels(issue);
   if (issue.state === "closed") {
@@ -895,9 +912,9 @@ async function updateIssue(issue: Issue) {
   }
 }
 
-async function updateIssuesAndPulls(issues: Issue[]) {
+async function updateIssuesAndPulls(issues: Issue[]): Promise<void> {
   log("Updating issues and pull requests");
-  for (let issue of issues) {
+  for (const issue of issues) {
     if (isPR(issue)) {
       await updatePull(issue);
     } else {
@@ -906,7 +923,7 @@ async function updateIssuesAndPulls(issues: Issue[]) {
   }
 }
 
-function cleanRemoteRepo() {
+function cleanRemoteRepo(): void {
   log("Clean destination remote of temporary branches");
   sh(`git -C ${mirrorDir} push --mirror ${config.destination.repo.url}`);
 }
@@ -946,7 +963,9 @@ function cleanRemoteRepo() {
       console.dir(missing);
     }
 
-    // await findCreators(items);
+    return;
+
+    await findCreators(items);
     await filterMentions(items);
 
     await createLabels(labels);
@@ -960,7 +979,7 @@ function cleanRemoteRepo() {
 
     await showRateLimit();
   } catch (e) {
-    console.dir(e);
+    console.dir(e, {depth: 5});
   }
 })();
 
