@@ -60,22 +60,44 @@ interface Repository {
   remote: string;
   owner: string;
   name: string;
-  url: string;
+  url: URL;
+}
+
+class Token {
+  private token: string;
+  public constructor(token: string) {
+    this.token = token;
+  }
+  public toString(): string {
+    return this.token;
+  }
+}
+
+class URL {
+  private url: string;
+  public constructor(url: string) {
+    this.url = url;
+  }
+  public toString(): string {
+    return this.url;
+  }
+}
+
+function url(url: string): URL {
+  return new URL(url);
 }
 
 function parseRepoUrl(cloneUrl: string): Repository {
   const matchSsh = /^git@([^:]+):([^/]+)\/(.+)\.git$/.exec(cloneUrl);
   if (matchSsh) {
-    return {remote: matchSsh[1], owner: matchSsh[2], name: matchSsh[3], url: cloneUrl};
+    return {remote: matchSsh[1], owner: matchSsh[2], name: matchSsh[3], url: url(cloneUrl)};
   }
   const matchHttp = /^https?:\/\/([^/]+)\/([^/]+)\/(.+)\.git$/.exec(cloneUrl);
   if (matchHttp) {
-    return {remote: matchHttp[1], owner: matchHttp[2], name: matchHttp[3], url: cloneUrl};
+    return {remote: matchHttp[1], owner: matchHttp[2], name: matchHttp[3], url: url(cloneUrl)};
   }
   throw `Repository '${cloneUrl}' is not in ssh or https format.`;
 }
-
-type Token = string;
 
 interface Config {
   source: SourceConfig;
@@ -84,14 +106,14 @@ interface Config {
 
 interface SourceConfig {
   url: URL;
-  api: URL;
+  api: string;
   repo: Repository;
   token: Token;
 }
 
 interface DestinationConfig {
   url: URL;
-  api: URL;
+  api: string;
   repo: Repository;
   default_token: Token;
   admin_token: Token;
@@ -119,17 +141,23 @@ const dstRepo = parseRepoUrl(cfgObj.destination.repository);
 
 const config: Config = {
   source: {
-    url: `${cfgObj.source.api}/repos/${srcRepo.owner}/${srcRepo.name}`,
+    url: url(`${cfgObj.source.api}/repos/${srcRepo.owner}/${srcRepo.name}`),
     repo: srcRepo,
     ...cfgObj.source,
+    token: new Token(cfgObj.source.token),
   },
   destination: {
-    url: `${cfgObj.destination.api}/repos/${dstRepo.owner}/${dstRepo.name}`,
+    url: url(`${cfgObj.destination.api}/repos/${dstRepo.owner}/${dstRepo.name}`),
     repo: dstRepo,
     ...cfgObj.destination,
+    default_token: new Token(cfgObj.destination.default_token),
+    admin_token: new Token(cfgObj.destination.admin_token),
+    tokens: Object.fromEntries(
+      cfgObj.destination.tokens.entries()
+        .map((item: [string, string]) => [item[0], new Token(item[1])])
+    )
   }
 }
-
 
 
 const repoDir = "data/" + config.source.repo.name;
@@ -145,15 +173,15 @@ const releasesPath = repoDir + "/releases.json";
 const mentionsPath = repoDir + "/mentions.json";
 const creatorsPath = repoDir + "/creators.json";
 
-async function invoke(method: Method, url: string, token?: Token, data?: object): Promise<AxiosResponse> {
+async function invoke(method: Method, url: URL, token?: Token, data?: object): Promise<AxiosResponse> {
   try {
     console.log(method, url);
     return await axios.request({
       method: method,
-      url: url,
+      url: url.toString(),
       data: data,
       headers: {
-        "Authorization": "token " + (token || config.source.token),
+        "Authorization": "token " + (token || config.source.token).toString(),
         "User-Agent": "node.js",
       },
     });
@@ -219,8 +247,6 @@ async function fetchReviews(issues): object {
   }
 }
 */
-
-type URL = string;
 
 interface Item {
   id: number;
@@ -290,7 +316,7 @@ interface Label {
 
 interface Commit {
   ref?: string;
-  url: string;
+  url: URL;
   sha: string;
 }
 
@@ -316,7 +342,7 @@ function isCommitComment(item: Item): item is CommitComment {
 }
 
 interface IssueComment extends Comment {
-  issue_url: string;
+  issue_url: URL;
 }
 
 function isIssueComment(item: Item): item is IssueComment {
@@ -334,8 +360,8 @@ interface Review extends Authorable {
 
 async function collectPages<T>(type: string): Promise<T[]> {
   return [].concat(...(await collectUntilNull(async page => {
-    const response = await get(`${config.source.url}/${type}?` +
-                               `page=${page}&state=all&per_page=100`);
+    const response = await get(url(`${config.source.url}/${type}?` +
+                               `page=${page}&state=all&per_page=100`));
     if (response.data.length === 0) {
       return null;
     }
@@ -344,7 +370,7 @@ async function collectPages<T>(type: string): Promise<T[]> {
 }
 
 async function fetchPR(issue: Issue): Promise<PullRequest> {
-  const pr = (await get(`${config.source.url}/pulls/${issue.number}`)).data;
+  const pr = (await get(url(`${config.source.url}/pulls/${issue.number}`))).data;
   const events: Event[] = (await get(issue.events_url)).data;
   const reviews = await collectPages<Review>(`pulls/${issue.number}/reviews`);
 
@@ -359,7 +385,7 @@ async function fetchPR(issue: Issue): Promise<PullRequest> {
 async function fetchIssue(issueNumber: number): Promise<Issue | null> {
   progress(`Fetching issue ${issueNumber}`);
   try {
-    const request = await get(`${config.source.url}/issues/${issueNumber}`);
+    const request = await get(url(`${config.source.url}/issues/${issueNumber}`));
     const issue = request.data as Issue;
 
     if (isPR(issue)) {
@@ -448,9 +474,8 @@ function moveRepository(): void {
 }
 
 async function commitExists(sha: string): Promise<boolean> {
-  const url = `${config.destination.url}/git/commits/${sha}`;
   try {
-    await get(url, config.destination.default_token);
+    await get(url(`${config.destination.url}/git/commits/${sha}`), config.destination.default_token);
     return true;
   } catch (e) {
     if (e.response.status == 404) {
