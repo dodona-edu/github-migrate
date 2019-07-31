@@ -24,6 +24,12 @@ program.version("0.1.0")
           "Overwrites steps if a file already exists instead of resuming.")
   .parse(process.argv);
 
+process.on("unhandledRejection", reason => {
+  console.log("Unhandled Rejection");
+  console.dir(reason, {depth: 4});
+  process.exit(1);
+});
+
 /**
  * Execute in shell, while connecting stdin, stdout and stderr to that of
  * the current process
@@ -153,8 +159,8 @@ const config: Config = {
     default_token: new Token(cfgObj.destination.default_token),
     admin_token: new Token(cfgObj.destination.admin_token),
     tokens: Object.fromEntries(
-      cfgObj.destination.tokens.entries()
-        .map((item: [string, string]) => [item[0], new Token(item[1])])
+      Object.entries(cfgObj.destination.tokens)
+        .map(item => [item[0], new Token(item[1] as string)])
     )
   }
 }
@@ -175,7 +181,7 @@ const creatorsPath = repoDir + "/creators.json";
 
 async function invoke(method: Method, url: URL, token?: Token, data?: object): Promise<AxiosResponse> {
   try {
-    console.log(method, url);
+    console.log(`${method.toUpperCase()} ${url}`);
     return await axios.request({
       method: method,
       url: url.toString(),
@@ -218,8 +224,6 @@ function put(url: URL, data: object, token?: Token): Promise<AxiosResponse> {
   return invoke("put", url, token, data);
 }
 
-
-
 /**
  * Call and await the given callback with an increasing integer while
  * collecting the result in an array. Continues until the callback returns
@@ -239,40 +243,25 @@ async function collectUntilNull<T>(
   return collector;
 }
 
-/*
-async function fetchReviews(issues): object {
-  log("Fetching reviews and review comments");
-  for (let pr of issues.filter(issue => issue.pull_request)) {
-    //
-  }
-}
-*/
-
 interface Item {
   id: number;
   url: URL;
-  created_at: Date;
+  created_at: string;
 }
 
 interface Authorable extends Item {
   user: User;
-  html_url: URL;
+  html_url: string;
   body: string;
 }
-
-/*
-function isAuthorable(item: Item): item is Authorable  {
-  return (item as Authorable).user !== undefined;
-}
-*/
 
 interface Issue extends Authorable {
   number: number;
   title: string;
   state: string;
-  events_url: URL;
+  events_url: string;
   closed_by: User;
-  closed_at: Date;
+  closed_at: string;
   labels: Label[];
 }
 
@@ -292,7 +281,6 @@ function isPR(item: Item): item is PullRequest  {
 }
 
 interface Comment extends Authorable {
-  created_at: Date;
 }
 
 interface User {
@@ -321,41 +309,55 @@ interface Commit {
 }
 
 interface PRComment extends Comment {
-  pull_request_url: URL;
-  path: string;
+  pull_request_url: string;
+  path?: string;
   original_commit_id: string;
-  original_position: number;
+  original_position?: number;
 }
 
+
 function isPRComment(item: Item): item is PRComment {
-  return (item as PRComment).pull_request_url !== undefined;
+  const comment = item as PRComment;
+  return comment.pull_request_url !== undefined &&
+         comment.original_commit_id !== undefined;
 }
 
 interface CommitComment extends Comment {
   commit_id: string;
   path: string;
   original_position: number;
+  submitted_at: string;
 }
 
 function isCommitComment(item: Item): item is CommitComment {
-  return (item as CommitComment).commit_id !== undefined;
+  return (item as CommitComment).commit_id !== undefined &&
+         (item as Review).pull_request_url === undefined;
 }
 
 interface IssueComment extends Comment {
-  issue_url: URL;
+  issue_url: string;
 }
 
 function isIssueComment(item: Item): item is IssueComment {
   return (item as IssueComment).issue_url !== undefined;
 }
 
-interface Event {
+
+interface Review extends Comment {
+  commit_id: string;
   event: string;
+  pull_request_url: string;
+  submitted_at: string;
 }
 
-interface Review extends Authorable {
-  commit_id: string;
-  state: string;
+function isReview(item: Item): item is Review {
+  const review = item as Review;
+  return review.pull_request_url !== undefined && review.event !== undefined;
+}
+
+
+interface Event {
+  event: string;
 }
 
 async function collectPages<T>(type: string): Promise<T[]> {
@@ -371,13 +373,11 @@ async function collectPages<T>(type: string): Promise<T[]> {
 
 async function fetchPR(issue: Issue): Promise<PullRequest> {
   const pr = (await get(url(`${config.source.url}/pulls/${issue.number}`))).data;
-  const events: Event[] = (await get(issue.events_url)).data;
-  const reviews = await collectPages<Review>(`pulls/${issue.number}/reviews`);
+  const events: Event[] = (await get(url(issue.events_url))).data;
 
   return {
     ...issue,
     ...pr,
-    reviews: reviews,
     merged: events.some(e => e.event === "merged")
   };
 }
@@ -424,7 +424,39 @@ async function fetchReleases(): Promise<Release[]> {
   return releases;
 }
 
-async function fetchComments(): Promise<Comment[]> {
+interface ReviewObj {
+  submitted_at: string;
+  state: string;
+  body: string;
+}
+
+async function fetchReviews(issues: Issue[]): Promise<Review[]> {
+  const reviews: Review[] = [];
+  const reviewEvent: Map<string, string> = new Map(
+    [["APPROVED", "APPROVE"],
+      ["COMMENTED", "COMMENT"],
+      ["CHANGES_REQUESTED", "REQUEST_CHANGES"]]
+  );
+  for (const issue of issues.filter(issue => isPR(issue))) {
+    const reviewObjs = await collectPages<ReviewObj>(`pulls/${issue.number}/reviews`);
+
+
+    for (const reviewObj of reviewObjs) {
+      // GitHub API ლ(ಠ益ಠ)ლ
+      const event = reviewEvent.get(reviewObj.state);
+      if (event === null) { throw "Unknown event state: " + reviewObj.state }
+      const review = {
+        ...reviewObj,
+        created_at: reviewObj.submitted_at,
+        event: event,
+      };
+      reviews.push((review as unknown) as Review);
+    }
+  }
+  return reviews;
+}
+
+async function fetchComments(issues: Issue[]): Promise<Comment[]> {
   log("Fetching comments");
   progress("Fetching pull comments");
   const pullComments = await collectPages<PRComment>("pulls/comments");
@@ -432,11 +464,11 @@ async function fetchComments(): Promise<Comment[]> {
   const issueComments = await collectPages<IssueComment>("issues/comments");
   progress("Fetching commit comments");
   const commitComments = await collectPages<CommitComment>("comments");
+  progress("Fetching review comments");
+  const reviewComments = await fetchReviews(issues);
   const comments = ([] as Comment[])
-    .concat(...pullComments)
-    .concat(...issueComments)
-    .concat(...commitComments)
-    .sort((a: Comment, b: Comment): number =>
+    .concat(pullComments, issueComments, commitComments, reviewComments)
+    .sort((a, b) =>
       new Date(a.created_at).valueOf() - new Date(b.created_at).valueOf());
   writeJson(commentPath, comments);
   return comments;
@@ -475,7 +507,8 @@ function moveRepository(): void {
 
 async function commitExists(sha: string): Promise<boolean> {
   try {
-    await get(url(`${config.destination.url}/git/commits/${sha}`), config.destination.default_token);
+    await get(url(`${config.destination.url}/git/commits/${sha}`),
+              config.destination.default_token);
     return true;
   } catch (e) {
     if (e.response.status == 404) {
@@ -489,12 +522,14 @@ async function commitExists(sha: string): Promise<boolean> {
 async function missingCommits(items: Item[]): Promise<Commit[]> {
   const commits = items
     .map((item): Commit | null => {
-      if (isPR(item)) { // Pull Request
-        return {url: item.html_url, sha: item.base.sha};
-      //} else if (item.pull_request_url) { // Review comment
-      // return {url: item.html_url, sha: item.original_commit_id};
-      } else if (isCommitComment(item)) { // Commit comment
-        return {url: item.html_url, sha: item.commit_id};
+      if (isPR(item)) {
+        return {url: url(item.html_url), sha: item.base.sha};
+      } else if (isPRComment(item)) {
+        return {url: url(item.html_url), sha: item.original_commit_id};
+      } else if (isCommitComment(item)) {
+        return {url: url(item.html_url), sha: item.commit_id};
+      } else if (isReview(item)) {
+        return {url: url(item.html_url), sha: item.commit_id};
       } else {
         return null;
       }
@@ -520,7 +555,7 @@ async function missingCommits(items: Item[]): Promise<Commit[]> {
 async function createBranch(branchname: string, sha: string): Promise<void> {
   progress(`Creating branch ${branchname}`);
   try {
-    await post(`${config.destination.url}/git/refs`,
+    await post(url(`${config.destination.url}/git/refs`),
                {
                  "ref": `refs/heads/${branchname}`,
                  "sha": sha,
@@ -535,14 +570,14 @@ async function createBranch(branchname: string, sha: string): Promise<void> {
   }
 }
 
-function formatDate(date: Date): string {
+function formatDate(date: string): string {
   const items = new Date(date).toString().split(" ");
   const day = items.slice(0, 4).join(" ");
   const time = items[4].split(":").slice(0, 2).join(":");
   return `${day} at ${time}`;
 }
 
-function authorToken(srcUser: User): string {
+function authorToken(srcUser: User): Token {
   const token = config.destination.tokens[srcUser.login];
   if (!token) {
     warn(`Missing token for ${srcUser.login}, using default token`);
@@ -565,6 +600,14 @@ function suffix(item: Authorable): string {
     type = "pull request";
   } else if (isIssue(item)) {
     type = "issue";
+  } else if (isReview(item)) {
+    if (item.event === "APPROVE") {
+      type = "approval";
+    } else if (item.event === "REQUEST_CHANGES") {
+      type = "change request";
+    } else {
+      type = "review";
+    }
   } else {
     type = "comment";
   }
@@ -615,10 +658,10 @@ async function createBrokenPullRequest(pull: PullRequest): Promise<void> {
   progress(`Creating broken PR #${pull.number}`);
   const notice = `_**Note:** the base commit (${pull.base.sha}) is lost,` +
     " so unfortunately we cannot show you the changes added by this PR._";
-  await post(`${config.destination.url}/pulls`,
+  await post(url(`${config.destination.url}/pulls`),
              {
                title: pull.title,
-               body: `${pull.body}\r\n\r\n${suffix(pull)}\r\n\r\n${notice}\r\n\r\n`,
+               body: `${pull.body}\n\n${suffix(pull)}\n\n${notice}\n\n`,
                head: head,
                base: base,
              },
@@ -639,10 +682,10 @@ async function createPullRequest(pull: PullRequest): Promise<void> {
   }
 
   try {
-    await post(`${config.destination.url}/pulls`,
+    await post(url(`${config.destination.url}/pulls`),
                {
                  title: pull.title,
-                 body: `${pull.body}\r\n\r\n${suffix(pull)}`,
+                 body: `${pull.body}\n\n${suffix(pull)}`,
                  head: head,
                  base: base,
                },
@@ -668,10 +711,10 @@ async function createPullRequest(pull: PullRequest): Promise<void> {
 
 async function createIssue(issue: Issue): Promise<void> {
   progress(`Creating issue #${issue.number}`);
-  await post(`${config.destination.url}/issues`,
+  await post(url(`${config.destination.url}/issues`),
              {
                title: issue.title,
-               body: `${issue.body}\r\n\r\n${suffix(issue)}`,
+               body: `${issue.body}\n\n${suffix(issue)}`,
              },
              authorToken(issue.user));
 }
@@ -717,7 +760,7 @@ async function filterMentions(items: Authorable[]): Promise<Map<string, string>>
 
       if (!mentions.has(username)) {
         try {
-          const response = await get(`${config.source.api}/users/${username}`);
+          const response = await get(url(`${config.source.api}/users/${username}`));
           const user = response.data;
           mentions.set(username, user.email);
         } catch (e) {
@@ -755,18 +798,18 @@ async function resetDestination(): Promise<void> {
     warn(e);
   }
   progress("Creating destination repository");
-  await post(`${config.destination.api}/orgs/${config.destination.repo.owner}/repos`,
+  await post(url(`${config.destination.api}/orgs/${config.destination.repo.owner}/repos`),
              {name: config.destination.repo.name, private: true},
              config.destination.admin_token);
 }
 
 async function createPullComment(comment: PRComment): Promise<void> {
   const pullNumber = comment.pull_request_url.split("/").pop();
-  progress(`Creating review comment for PR #${pullNumber} (${comment.id})`);
+  progress(`Creating PR comment for PR #${pullNumber} (${comment.id})`);
   try {
-    await post(`${config.destination.url}/pulls/${pullNumber}/comments`,
+    await post(url(`${config.destination.url}/pulls/${pullNumber}/comments`),
                {
-                 body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+                 body: `${comment.body}\n\n${suffix(comment)}`,
                  commit_id: comment.original_commit_id,
                  path: comment.path,
                  position: comment.original_position,
@@ -775,7 +818,8 @@ async function createPullComment(comment: PRComment): Promise<void> {
   } catch (e) {
     if (e.response.status == 422 &&
         e.response.data.errors[0].message.endsWith("is not part of the pull request")) {
-      warn("Ignoring review comment because the original commit is gone.");
+      warn(`Ignoring PR comment because the original commit is gone. (${comment.html_url})`);
+      console.dir(comment);
     } else {
       throw e;
     }
@@ -784,9 +828,9 @@ async function createPullComment(comment: PRComment): Promise<void> {
 
 async function createCommitComment(comment: CommitComment): Promise<void> {
   progress(`Creating commit comment for ${comment.commit_id} (${comment.id})`);
-  await post(`${config.destination.url}/commits/${comment.commit_id}/comments`,
+  await post(url(`${config.destination.url}/commits/${comment.commit_id}/comments`),
              {
-               body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+               body: `${comment.body}\n\n${suffix(comment)}`,
                commit_id: comment.commit_id,
                path: comment.path,
                position: comment.original_position,
@@ -798,11 +842,34 @@ async function createCommitComment(comment: CommitComment): Promise<void> {
 async function createIssueComment(comment: IssueComment): Promise<void> {
   const issueNumber = comment.issue_url.split("/").pop();
   progress(`Creating issue comment for #${issueNumber} (${comment.id})`);
-  await post(`${config.destination.url}/issues/${issueNumber}/comments`,
+  await post(url(`${config.destination.url}/issues/${issueNumber}/comments`),
              {
-               body: `${comment.body}\r\n\r\n${suffix(comment)}`,
+               body: `${comment.body}\n\n${suffix(comment)}`,
              },
              authorToken(comment.user));
+}
+
+async function createReview(review: Review): Promise<void> {
+  progress(`Creating review ${review.html_url}`);
+  const pr = review.pull_request_url.split("/").pop();
+  const body = review.body.length > 0 
+    ? `${review.body}\n\n${suffix(review)}`
+    : suffix(review);
+  try {
+    if (review.event !== "COMMENT" || review.body.length > 0) {
+      await post(url(`${config.destination.url}/pulls/${pr}/reviews`),
+                 {
+                   body: body,
+                   event: review.event,
+                 },
+                 config.destination.admin_token/* authorToken(review.user)*/);
+      //TODO fix token
+    } else {
+      warn(`Ignoring review comment ${review.html_url}`);
+    }
+  } catch (e) {
+    warn(`Error creating review :${e}`);
+  }
 }
 
 async function createComments(comments: Comment[], missingCommits: Commit[]): Promise<void> {
@@ -810,13 +877,17 @@ async function createComments(comments: Comment[], missingCommits: Commit[]): Pr
   const missingHashes = new Set(missingCommits.map(c => c.sha));
   for (const comment of comments) {
     if (isPRComment(comment)) {
-      await createPullComment(comment);
+      if(!missingHashes.has(comment.original_commit_id)){
+        await createPullComment(comment);
+      }
     } else if (isCommitComment(comment)) {
       if (!missingHashes.has(comment.commit_id)) {
         await createCommitComment(comment);
       }
     } else if (isIssueComment(comment)) {
       await createIssueComment(comment);
+    } else if (isReview(comment)) {
+      await createReview(comment);
     } else {
       throw "Unknown comment type";
     }
@@ -832,7 +903,7 @@ async function createLabels(labels: Label[]): Promise<void> {
   });
   for (const label of labels) {
     try {
-      await post(`${config.destination.url}/labels`,
+      await post(url(`${config.destination.url}/labels`),
                  {
                    name: label.name,
                    color: label.color,
@@ -858,7 +929,7 @@ async function showRateLimit(): Promise<void> {
 }
 
 async function addLabels(issue: Issue): Promise<void> {
-  await patch(`${config.destination.url}/issues/${issue.number}`,
+  await patch(url(`${config.destination.url}/issues/${issue.number}`),
               {
                 labels: issue.labels
                   .map(label => label.name)
@@ -889,7 +960,7 @@ async function updatePull(pull: PullRequest): Promise<void> {
   if (pull.merged) {
     progress(`Merging PR #${pull.number}`);
     try {
-      await put(`${config.destination.url}/pulls/${pull.number}/merge`,
+      await put(url(`${config.destination.url}/pulls/${pull.number}/merge`),
                 {},
                 authorToken(pull.closed_by));
     } catch (e) {
@@ -901,7 +972,7 @@ async function updatePull(pull: PullRequest): Promise<void> {
       }
     }
   } else if (pull.state === "closed") {
-    await patch(`${config.destination.url}/pulls/${pull.number}`,
+    await patch(url(`${config.destination.url}/pulls/${pull.number}`),
                 {
                   state: pull.state,
                 },
@@ -913,7 +984,7 @@ async function createReleases(releases: Release[]): Promise<void> {
   log("Creating releases");
   for (const release of releases) {
     progress(`Creating release ${release.name}`);
-    await post(`${config.destination.url}/releases`,
+    await post(url(`${config.destination.url}/releases`),
                {
                  name: release.name,
                  tag_name: release.tag_name,
@@ -929,7 +1000,7 @@ async function updateIssue(issue: Issue): Promise<void> {
   progress(`Updating issue #${issue.number}`);
   await addLabels(issue);
   if (issue.state === "closed") {
-    await patch(`${config.destination.url}/issues/${issue.number}`,
+    await patch(url(`${config.destination.url}/issues/${issue.number}`),
                 {
                   state: issue.state,
                 },
@@ -966,7 +1037,7 @@ function cleanRemoteRepo(): void {
       : readJson<Issue[]>(issuePath);
 
     const comments = checkIfNeeded(commentPath)
-      ? (await fetchComments())
+      ? (await fetchComments(issues))
       : readJson<Comment[]>(commentPath);
 
     const labels = checkIfNeeded(labelsPath)
@@ -988,8 +1059,6 @@ function cleanRemoteRepo(): void {
       console.dir(missing);
     }
 
-    return;
-
     await findCreators(items);
     await filterMentions(items);
 
@@ -1005,17 +1074,7 @@ function cleanRemoteRepo(): void {
     await showRateLimit();
   } catch (e) {
     console.dir(e, {depth: 5});
+    throw e;
   }
 })();
-
-
-/* const url = config.destination.repoUrl + "/issues";
-const data = {
-  "title": "test issue",
-  "body": "test issue aangemaakt om tokens te testen",
-};
-
-post(url, data, () => {}, config.destination.tokens["fvdrjeug"]);
-*/
-
 

@@ -13,6 +13,8 @@
         "rules": {
             "@typescript-eslint/indent": ["error", 2, {"CallExpression": {"arguments": "first"}}],
             "@typescript-eslint/explicit-function-return-type": ["error", {"allowExpressions": true}],
+            "@typescript-eslint/no-explicit-any": ["off"],
+            "@typescript-eslint/no-empty-interface": ["off"],
             "arrow-parens": ["error", "as-needed"],
             "no-underscore-dangle": "off",
             "no-use-before-define": "off",
