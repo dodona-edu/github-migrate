@@ -145,6 +145,11 @@ cfgObj.destination.repository = program.source || cfgObj.destination.repository;
 const srcRepo = parseRepoUrl(cfgObj.source.repository);
 const dstRepo = parseRepoUrl(cfgObj.destination.repository);
 
+const tokens: StringMap<Token> = {};
+for (const [key, token] of Object.entries(cfgObj.destination.tokens)) {
+  tokens[key] = new Token(token as string);
+}
+
 const config: Config = {
   source: {
     url: url(`${cfgObj.source.api}/repos/${srcRepo.owner}/${srcRepo.name}`),
@@ -158,10 +163,7 @@ const config: Config = {
     ...cfgObj.destination,
     default_token: new Token(cfgObj.destination.default_token),
     admin_token: new Token(cfgObj.destination.admin_token),
-    tokens: Object.fromEntries(
-      Object.entries(cfgObj.destination.tokens)
-        .map(item => [item[0], new Token(item[1] as string)])
-    )
+    tokens: tokens,
   }
 }
 
@@ -648,7 +650,7 @@ async function createBrokenPullRequest(pull: PullRequest): Promise<void> {
 
   const authorName = config.destination.committer_name;
   const authorEmail = config.destination.committer_email;
-  sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}"` +
+  sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}" ` +
      `GIT_AUTHOR_NAME="${authorName}" GIT_AUTHOR_EMAIL="${authorEmail}" ` +
      `git -C ${cloneDir} commit --allow-empty --message "Dummy commit for PR #${pull.number}"`);
 
@@ -946,7 +948,7 @@ function mergeUnmergeable(pull: PullRequest): void {
   // Merge using the 'ours' strategy, which resolves conflicts for us
   const authorName = config.destination.committer_name;
   const authorEmail = config.destination.committer_email;
-  sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}"` +
+  sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}" ` +
      `GIT_AUTHOR_NAME="${authorName} GIT_AUTHOR_EMAIL=${authorEmail}" ` +
      `git -C ${cloneDir} merge origin/${head} -s ours --no-edit`);
 
