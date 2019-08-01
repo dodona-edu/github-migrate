@@ -1,0 +1,53 @@
+---
+# Deletes the destination repository (if it already existed) and recreates
+# it using the `destination.admin_token`. Useful to retry a migration.
+# Can also be enabled with the --reset or -r flag.
+reset: false
+
+# After fetching items (issues, comments, ...) they are saved in the
+# `data/{reponame}/` directory. If the migration is retried and these items
+# already exist in this directory, we will not fetch them again.
+# If overwrite is true, we will remove the saved items and redownload them.
+# Can also be enabled with the --overwirite or -o flag.
+overwrite: true
+
+# If false, this will perform all actions (issues, comments, ...) with the
+# `destination.default_token`, can also be enabled with --for-real or -f flag.
+for_real: false
+
+# Where we are migrating from
+source:
+  # API URL
+  api: "https://github.enterprise.com/api/v3"
+  # Current clone URL of the source repository (in SSH or HTTPS format)
+  # This can be overwritten with the --source="{repository}" flag
+  repository: "git@github.enterprise.com:owner/repo.git"
+  # Token which has access to this repository
+  token: "0000000000000000000000000000000000000000"
+
+# Where we are migrating to
+destination:
+  # API URL
+  api: "https://api.github.com"
+  # Desired Clone URL of the destination repository (in SSH or HTTPS format)
+  # This can be overwritten with the --destination="{repository}" flag
+  # It is not neccesary that this repository already exists, you can let the
+  # script create the repository with the --reset or -r flag.
+  repository: "git@github.com:new-owner/repo.git"
+  # Default token to perform actions with (creating issues, comments, ...).
+  # If an action doesn't have an author or the token of the author is not
+  # configured, this token will be used.
+  default_token: "0000000000000000000000000000000000000000"
+  # Admin token which will only be used to delete and create the destination
+  # repository when the --reset flag is used. Can be left empty.
+  admin_token: "0000000000000000000000000000000000000000"
+  # If we need to manually commit or merge use the following name and email:
+  committer_name: "Automatic Committer"
+  committer_email: "user@enterprise.com"
+  # Mapping of 'source' to 'destination' usernames
+  usernames:
+    "username-github-enterprise": "username-public-github"
+
+  # Mappign of 'source' usernames to tokens for the destination
+  tokens:
+    "username-github-enterprise": "0000000000000000000000000000000000000000"
