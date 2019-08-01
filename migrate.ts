@@ -22,6 +22,10 @@ program.version("0.1.0")
           "Deletes and recreate the destination repository. Use with caution!")
   .option("-o, --overwrite",
           "Overwrites steps if a file already exists instead of resuming.")
+  .option("-f, --for-real",
+          "Perform the migration while using the actual user tokens " +
+          "and actually mentioning users. This wil cause GitHub to send" +
+          "a lot of emails.")
   .parse(process.argv);
 
 process.on("unhandledRejection", reason => {
@@ -106,6 +110,7 @@ function parseRepoUrl(cloneUrl: string): Repository {
 }
 
 interface Config {
+  for_real: boolean;
   source: SourceConfig;
   destination: DestinationConfig;
 }
@@ -151,6 +156,7 @@ for (const [key, token] of Object.entries(cfgObj.destination.tokens)) {
 }
 
 const config: Config = {
+  for_real: program.forReal || cfgObj.for_real,
   source: {
     url: url(`${cfgObj.source.api}/repos/${srcRepo.owner}/${srcRepo.name}`),
     repo: srcRepo,
@@ -584,7 +590,7 @@ function authorToken(srcUser: User): Token {
   if (!token) {
     warn(`Missing token for ${srcUser.login}, using default token`);
   }
-  if (srcUser.login === "rbmaerte") { // TODO: turn on for all users
+  if (config.for_real) {
     return token || config.destination.default_token;
   } else {
     return config.destination.default_token;
@@ -593,7 +599,11 @@ function authorToken(srcUser: User): Token {
 
 function author(srcUser: User): string {
   const user = config.destination.usernames[srcUser.login];
-  return user ? `\`@${user}\`` : srcUser.login; // TODO: actually mention
+  if (config.for_real) {
+    return user ? `@${user}` : srcUser.login;
+  } else {
+    return user ? `\`@${user}\`` : srcUser.login;
+  }
 }
 
 function suffix(item: Authorable): string {
@@ -772,8 +782,11 @@ async function filterMentions(items: Authorable[]): Promise<Map<string, string>>
 
       const newName = config.destination.usernames[username];
       if (newName) {
-        // TODO: actually mention user
-        parts.push(`\`@${newName}\``);
+        if (config.for_real) {
+          parts.push(`@${newName}`);
+        } else {
+          parts.push(`\`@${newName}\``);
+        }
       } else {
         parts.push(`\`@${username}\``);
       }
@@ -864,8 +877,7 @@ async function createReview(review: Review): Promise<void> {
                    body: body,
                    event: review.event,
                  },
-                 config.destination.admin_token/* authorToken(review.user)*/);
-      //TODO fix token
+                 authorToken(review.user));
     } else {
       warn(`Ignoring review comment ${review.html_url}`);
     }
