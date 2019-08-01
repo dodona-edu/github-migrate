@@ -145,7 +145,7 @@ const cfgObj = yaml.safeLoad(fs.readFileSync(configFile).toString());
 cfgObj.destination.admin_token = cfgObj.destination.admin_token || cfgObj.destination.default_token;
 
 cfgObj.source.repository = program.source || cfgObj.source.repository;
-cfgObj.destination.repository = program.source || cfgObj.destination.repository;
+cfgObj.destination.repository = program.destination || cfgObj.destination.repository;
 
 const srcRepo = parseRepoUrl(cfgObj.source.repository);
 const dstRepo = parseRepoUrl(cfgObj.destination.repository);
