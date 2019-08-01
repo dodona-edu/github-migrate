@@ -912,7 +912,7 @@ async function createLabels(labels: Label[]): Promise<void> {
   log("Creating labels");
   labels.push({
     name: "migrated",
-    color: "8fbcea",
+    color: "ffffff",
     description: "This item originates from the migrated github.ugent.be repository",
   });
   for (const label of labels) {
@@ -1087,7 +1087,7 @@ function cleanRemoteRepo(): void {
 
     await showRateLimit();
   } catch (e) {
-    console.dir(e, {depth: 5});
+    console.dir(e, {depth: 4});
     throw e;
   }
 })();
