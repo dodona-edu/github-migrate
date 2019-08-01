@@ -110,6 +110,8 @@ function parseRepoUrl(cloneUrl: string): Repository {
 }
 
 interface Config {
+  reset: boolean;
+  overwrite: boolean;
   for_real: boolean;
   source: SourceConfig;
   destination: DestinationConfig;
@@ -139,6 +141,12 @@ interface StringMap<T> {
 }
 
 const configFile = program.config || "./config.yml";
+if (!fs.existsSync(configFile)) {
+  warn(`Config file ${configFile} does not exist. `
+    + " You can copy the example configuration from config.example.yml");
+  process.exit(1);
+}
+
 const cfgObj = yaml.safeLoad(fs.readFileSync(configFile).toString());
 
 /* eslint @typescript-eslint/camelcase: "off"*/
@@ -156,6 +164,8 @@ for (const [key, token] of Object.entries(cfgObj.destination.tokens)) {
 }
 
 const config: Config = {
+  reset: program.reset,
+  overwrite: program.overwrite,
   for_real: program.forReal || cfgObj.for_real,
   source: {
     url: url(`${cfgObj.source.api}/repos/${srcRepo.owner}/${srcRepo.name}`),
@@ -204,6 +214,10 @@ async function invoke(method: Method, url: URL, token?: Token, data?: object): P
     if (response.status === 403 &&
         response.headers["x-ratelimit-remaining"] == 0) {
       warn("Ratelimit encountered, retrying in 1 second");
+      sh("sleep 1");
+      return await invoke(method, url, token, data);
+    } if (response.status === 500) {
+      warn("Got internal server error, retrying in 1 second");
       sh("sleep 1");
       return await invoke(method, url, token, data);
     } else {
@@ -484,7 +498,7 @@ async function fetchComments(issues: Issue[]): Promise<Comment[]> {
 
 function checkIfNeeded(path: string): boolean {
   if (fs.existsSync(path)) {
-    if (program.overwrite) {
+    if (config.overwrite) {
       sh(`rm -rf ${path}`);
     } else {
       return false;
@@ -961,7 +975,7 @@ function mergeUnmergeable(pull: PullRequest): void {
   const authorName = config.destination.committer_name;
   const authorEmail = config.destination.committer_email;
   sh(`GIT_COMMITTER_NAME="${authorName}" GIT_COMITTER_EMAIL="${authorEmail}" ` +
-     `GIT_AUTHOR_NAME="${authorName} GIT_AUTHOR_EMAIL=${authorEmail}" ` +
+     `GIT_AUTHOR_NAME="${authorName}" GIT_AUTHOR_EMAIL="${authorEmail}" ` +
      `git -C ${cloneDir} merge origin/${head} -s ours --no-edit`);
 
   sh(`git -C ${cloneDir} push ${config.destination.repo.url} ${base}`);
@@ -1040,7 +1054,7 @@ function cleanRemoteRepo(): void {
 
 (async () => {
   try {
-    if (program.reset) {
+    if (config.reset) {
       await resetDestination();
     }
 
