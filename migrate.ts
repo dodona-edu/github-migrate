@@ -330,7 +330,7 @@ interface Milestone {
   number: number;
   title: string;
   state: string;
-  description: string;
+  description?: string;
   due_on?: string;
 }
 
@@ -972,9 +972,11 @@ async function createMilestones(milestones: Milestone[]): Promise<void> {
     try {
       const data: any = {
         title: milestone.title,
-        description: milestone.description,
         state: milestone.state,
       };
+      if (milestone.description) {
+        data.description = milestone.description;
+      }
       if (milestone.due_on) {
         data.due_on = milestone.due_on;
       }
@@ -1010,7 +1012,7 @@ async function addLabels(issue: Issue): Promise<void> {
               config.destination.default_token);
 }
 
-async function addMilestones(issue: Issue): Promise<void> {
+async function addMilestone(issue: Issue): Promise<void> {
   if(issue.milestone) {
     await patch(url(`${config.destination.url}/issues/${issue.number}`),
                 {
@@ -1039,6 +1041,7 @@ function mergeUnmergeable(pull: PullRequest): void {
 async function updatePull(pull: PullRequest): Promise<void> {
   progress(`Updating PR #${pull.number}`);
   await addLabels(pull);
+  await addMilestone(pull);
   if (pull.merged) {
     progress(`Merging PR #${pull.number}`);
     try {
@@ -1081,7 +1084,7 @@ async function createReleases(releases: Release[]): Promise<void> {
 async function updateIssue(issue: Issue): Promise<void> {
   progress(`Updating issue #${issue.number}`);
   await addLabels(issue);
-  await addMilestones(issue);
+  await addMilestone(issue);
   if (issue.state === "closed") {
     await patch(url(`${config.destination.url}/issues/${issue.number}`),
                 {
