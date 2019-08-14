@@ -191,6 +191,7 @@ const cloneDir = repoDir + "/clone";
 const mirrorDir = repoDir + "/mirror.git";
 const issuePath = repoDir + "/issues.json";
 const labelsPath = repoDir + "/labels.json";
+const milestonesPath = repoDir + "/milestones.json";
 const missingPath = repoDir + "/missing.json";
 const commentPath = repoDir + "/comments.json";
 const releasesPath = repoDir + "/releases.json";
@@ -285,6 +286,7 @@ interface Issue extends Authorable {
   closed_by: User;
   closed_at: string;
   labels: Label[];
+  milestone?: Milestone;
 }
 
 function isIssue(item: Item): item is Issue {
@@ -322,6 +324,14 @@ interface Label {
   name: string;
   color: string;
   description: string;
+}
+
+interface Milestone {
+  number: number;
+  title: string;
+  state: string;
+  description?: string;
+  due_on?: string;
 }
 
 interface Commit {
@@ -437,6 +447,14 @@ async function fetchLabels(): Promise<Label[]> {
   const labels = await collectPages<Label>("labels");
   writeJson(labelsPath, labels);
   return labels;
+}
+
+async function fetchMilestones(): Promise<Milestone[]> {
+  log("Fetching milestones");
+  const milestones = (await collectPages<Milestone>("milestones"))
+    .sort((a, b) => a.number - b.number);
+  writeJson(milestonesPath, milestones);
+  return milestones;
 }
 
 async function fetchReleases(): Promise<Release[]> {
@@ -948,6 +966,34 @@ async function createLabels(labels: Label[]): Promise<void> {
   }
 }
 
+async function createMilestones(milestones: Milestone[]): Promise<void> {
+  log("Creating milestones");
+  for (const milestone of milestones) {
+    try {
+      const data: any = {
+        title: milestone.title,
+        state: milestone.state,
+      };
+      if (milestone.description) {
+        data.description = milestone.description;
+      }
+      if (milestone.due_on) {
+        data.due_on = milestone.due_on;
+      }
+
+      await post(url(`${config.destination.url}/milestones`),
+                 data,
+                 config.destination.default_token);
+    } catch (e) {
+      if (e.response.status == 422) {
+        warn(`Milestone ${milestone.title} already exists`);
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 async function showRateLimit(): Promise<void> {
   const response = await get(config.destination.url,
                              config.destination.default_token);
@@ -964,6 +1010,16 @@ async function addLabels(issue: Issue): Promise<void> {
                   .concat(["migrated"]),
               },
               config.destination.default_token);
+}
+
+async function addMilestone(issue: Issue): Promise<void> {
+  if(issue.milestone) {
+    await patch(url(`${config.destination.url}/issues/${issue.number}`),
+                {
+                  milestone: issue.milestone.number
+                },
+                config.destination.default_token);
+  }
 }
 
 function mergeUnmergeable(pull: PullRequest): void {
@@ -985,6 +1041,7 @@ function mergeUnmergeable(pull: PullRequest): void {
 async function updatePull(pull: PullRequest): Promise<void> {
   progress(`Updating PR #${pull.number}`);
   await addLabels(pull);
+  await addMilestone(pull);
   if (pull.merged) {
     progress(`Merging PR #${pull.number}`);
     try {
@@ -1027,6 +1084,7 @@ async function createReleases(releases: Release[]): Promise<void> {
 async function updateIssue(issue: Issue): Promise<void> {
   progress(`Updating issue #${issue.number}`);
   await addLabels(issue);
+  await addMilestone(issue);
   if (issue.state === "closed") {
     await patch(url(`${config.destination.url}/issues/${issue.number}`),
                 {
@@ -1072,6 +1130,10 @@ function cleanRemoteRepo(): void {
       ? (await fetchLabels())
       : readJson<Label[]>(labelsPath);
 
+    const milestones = checkIfNeeded(milestonesPath)
+      ? (await fetchMilestones())
+      : readJson<Milestone[]>(milestonesPath);
+
     const releases = checkIfNeeded(releasesPath)
       ? (await fetchReleases())
       : readJson<Release[]>(releasesPath);
@@ -1091,6 +1153,7 @@ function cleanRemoteRepo(): void {
     await filterMentions(items);
 
     await createLabels(labels);
+    await createMilestones(milestones);
     await createIssuesAndPulls(issues, missing);
     await createComments(comments, missing);
 
